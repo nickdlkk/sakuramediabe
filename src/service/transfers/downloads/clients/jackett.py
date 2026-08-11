@@ -183,18 +183,29 @@ class JackettClient:
 
     @classmethod
     def _split_download_links(cls, *raw_links) -> tuple[str, str]:
-        # 按内容把候选链接分流成磁力链与 .torrent 文件地址，各取第一个有效值
+        # 优先选择真正的上游 .torrent 直链。Jackett 的 /dl/<indexer>/... 代理有时会返回被站点
+        # 转载/镜像后的 torrent 元数据（例如 created by/comment 指向其他站点），而同一条目里的
+        # guid 往往仍是原站直链。这里按内容与来源共同判定：
+        #   1. magnet 仍优先归 magnet_url
+        #   2. 非磁力链接里，优先选择“不是本地 Jackett /dl/ 代理且以 .torrent 结尾”的直链
+        #   3. 若没有直链，再回退到第一个非磁力链接（通常是 Jackett /dl/ 代理）
         magnet_url = ""
-        torrent_url = ""
+        direct_torrent_url = ""
+        fallback_torrent_url = ""
         for raw in raw_links:
             link = cls._coerce_text(raw)
             if not link:
                 continue
-            if link.lower().startswith("magnet:"):
+            lower = link.lower()
+            if lower.startswith("magnet:"):
                 magnet_url = magnet_url or link
-            else:
-                torrent_url = torrent_url or link
-        return magnet_url, torrent_url
+                continue
+            if not fallback_torrent_url:
+                fallback_torrent_url = link
+            if lower.endswith('.torrent') and '/dl/' not in lower:
+                direct_torrent_url = direct_torrent_url or link
+        return magnet_url, (direct_torrent_url or fallback_torrent_url)
+
 
     @staticmethod
     def _coerce_mapping(value) -> dict:
