@@ -42,6 +42,7 @@ class AuthService:
         UserRefreshToken.create(
             token_id=token_id,
             token_hash=token_hash,
+            user=user,
             status=RefreshTokenStatus.ACTIVE.value,
             expires_at=AuthService._to_db_datetime(refresh_expires_at),
             client_ip=client_ip,
@@ -74,7 +75,10 @@ class AuthService:
         if expires_at < AuthService._utcnow_naive():
             raise ApiError(401, "invalid_refresh_token", "Refresh token is invalid")
 
-        user = User.select().order_by(User.id).first()
+        user = token_record.user
+        if user is None:
+            # 兜底：存量无归属记录归到首个用户（既有唯一账号即管理员）。
+            user = User.select().order_by(User.id).first()
         if user is None:
             raise ApiError(401, "unauthorized", "Invalid access token")
 

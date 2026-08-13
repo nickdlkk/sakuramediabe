@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query, status
 
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_DOWNLOAD_MANAGEMENT
 from src.schema.common.pagination import PageResponse
 from src.schema.transfers.media_import import (
     DeleteFailedFileRequest,
@@ -21,7 +22,11 @@ from src.service.transfers.imports.job_service import (
 
 router = APIRouter(
     tags=["media-import"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT)),
+    ],
 )
 
 

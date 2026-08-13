@@ -1,11 +1,16 @@
-
 from fastapi import APIRouter, Depends, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from src.api.exception.errors import ApiError
 from src.api.routers._utils import sse_streaming_response, to_sse_event
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import (
+    db_deps,
+    get_current_user,
+    require_admin_dependency,
+    require_module_dependency,
+)
+from src.model.system.user import MODULE_DOWNLOAD_MANAGEMENT
 from src.schema.common.pagination import PageResponse
 from src.schema.transfers.downloads import (
     DownloadCandidateResource,
@@ -34,7 +39,11 @@ router = APIRouter(
 )
 
 
-@router.get("/download-clients", response_model=list[DownloadClientResource])
+@router.get(
+    "/download-clients",
+    response_model=list[DownloadClientResource],
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
+)
 def list_download_clients(current_user=Depends(get_current_user)):
     return DownloadClientService.list_clients()
 
@@ -43,6 +52,7 @@ def list_download_clients(current_user=Depends(get_current_user)):
     "/download-clients",
     response_model=DownloadClientResource,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_dependency)],
 )
 def create_download_client(
     payload: DownloadClientCreateRequest,
@@ -53,7 +63,11 @@ def create_download_client(
 
 # 注意:probe/* 静态路径必须声明在 {client_id} 参数化路径之前,
 # 否则 FastAPI 会先尝试用 "probe" 匹配 client_id: int 并返回 422。
-@router.post("/download-clients/probe/test", response_model=DownloadClientTestResponse)
+@router.post(
+    "/download-clients/probe/test",
+    response_model=DownloadClientTestResponse,
+    dependencies=[Depends(require_admin_dependency)],
+)
 def probe_test_download_client(
     payload: DownloadClientProbeTestRequest,
     current_user=Depends(get_current_user),
@@ -64,6 +78,7 @@ def probe_test_download_client(
 @router.post(
     "/download-clients/probe/storage-test",
     response_model=DownloadClientStorageTestResponse,
+    dependencies=[Depends(require_admin_dependency)],
 )
 def probe_test_download_client_storage(
     payload: DownloadClientProbeStorageTestRequest,
@@ -72,7 +87,11 @@ def probe_test_download_client_storage(
     return DownloadClientService.probe_storage_test(payload)
 
 
-@router.patch("/download-clients/{client_id}", response_model=DownloadClientResource)
+@router.patch(
+    "/download-clients/{client_id}",
+    response_model=DownloadClientResource,
+    dependencies=[Depends(require_admin_dependency)],
+)
 def update_download_client(
     client_id: int,
     payload: DownloadClientUpdateRequest,
@@ -81,23 +100,39 @@ def update_download_client(
     return DownloadClientService.update_client(client_id, payload)
 
 
-@router.delete("/download-clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/download-clients/{client_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin_dependency)],
+)
 def delete_download_client(client_id: int, current_user=Depends(get_current_user)):
     DownloadClientService.delete_client(client_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/download-clients/{client_id}/test", response_model=DownloadClientTestResponse)
+@router.get(
+    "/download-clients/{client_id}/test",
+    response_model=DownloadClientTestResponse,
+    dependencies=[Depends(require_admin_dependency)],
+)
 def test_download_client(client_id: int, current_user=Depends(get_current_user)):
     return DownloadClientService.test_client(client_id)
 
 
-@router.post("/download-clients/{client_id}/storage-test", response_model=DownloadClientStorageTestResponse)
+@router.post(
+    "/download-clients/{client_id}/storage-test",
+    response_model=DownloadClientStorageTestResponse,
+    dependencies=[Depends(require_admin_dependency)],
+)
 def test_download_client_storage(client_id: int, current_user=Depends(get_current_user)):
     return DownloadClientService.test_storage(client_id)
 
 
-@router.get("/download-candidates", response_model=list[DownloadCandidateResource])
+@router.get(
+    "/download-candidates",
+    response_model=list[DownloadCandidateResource],
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
+)
 def list_download_candidates(
     query: DownloadCandidatesQuery = Depends(),
     current_user=Depends(get_current_user),
@@ -108,7 +143,11 @@ def list_download_candidates(
     )
 
 
-@router.post("/download-requests", response_model=DownloadRequestCreateResponse)
+@router.post(
+    "/download-requests",
+    response_model=DownloadRequestCreateResponse,
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
+)
 def create_download_request(
     payload: DownloadRequestCreateRequest,
     current_user=Depends(get_current_user),
@@ -118,7 +157,11 @@ def create_download_request(
     return JSONResponse(status_code=status_code, content=jsonable_encoder(result))
 
 
-@router.get("/download-tasks", response_model=PageResponse[DownloadTaskResource])
+@router.get(
+    "/download-tasks",
+    response_model=PageResponse[DownloadTaskResource],
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
+)
 def list_download_tasks(
     query: DownloadTasksQuery = Depends(),
     current_user=Depends(get_current_user),
@@ -133,7 +176,10 @@ def list_download_tasks(
     )
 
 
-@router.get("/download-tasks/stream")
+@router.get(
+    "/download-tasks/stream",
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
+)
 def stream_download_tasks(
     request: Request,
     client_id: int | None = Query(default=None, gt=0),
@@ -153,6 +199,7 @@ def stream_download_tasks(
 @router.post(
     "/download-tasks/{task_id}/pause",
     response_model=DownloadTaskActionResponse,
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
 )
 def pause_download_task(task_id: int, current_user=Depends(get_current_user)):
     return DownloadTaskService.pause_task(task_id)
@@ -161,12 +208,17 @@ def pause_download_task(task_id: int, current_user=Depends(get_current_user)):
 @router.post(
     "/download-tasks/{task_id}/resume",
     response_model=DownloadTaskActionResponse,
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
 )
 def resume_download_task(task_id: int, current_user=Depends(get_current_user)):
     return DownloadTaskService.resume_task(task_id)
 
 
-@router.delete("/download-tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/download-tasks/{task_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT))],
+)
 def delete_download_task(
     task_id: int,
     request: Request,

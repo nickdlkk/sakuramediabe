@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_DOWNLOAD_MANAGEMENT
 from src.schema.catalog.subscriptions import (
     MovieSubscriptionListItemResource,
     MovieSubscriptionSort,
@@ -15,7 +16,11 @@ from src.service.catalog import MovieSubscriptionService
 router = APIRouter(
     prefix="/movie-subscriptions",
     tags=["movie-subscriptions"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT)),
+    ],
 )
 
 

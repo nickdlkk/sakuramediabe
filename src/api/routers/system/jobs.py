@@ -2,7 +2,7 @@ import peewee
 from fastapi import APIRouter, Depends
 
 from src.api.exception.errors import ApiError
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_admin_dependency
 from src.model import BackgroundTaskRun
 from src.scheduler.contracts import JobDefinition
 from src.scheduler.registry import JOB_REGISTRY, JOB_REGISTRY_BY_KEY
@@ -13,7 +13,7 @@ from src.start.aps import get_job_cron_setting, resolve_job_cron_expr, submit_ma
 
 router = APIRouter(
     tags=["jobs"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[Depends(db_deps), Depends(require_admin_dependency)],
 )
 
 

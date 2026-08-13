@@ -2,7 +2,8 @@
 from fastapi import APIRouter, Depends, Response, status
 
 from src.api.routers._utils import sse_streaming_response, to_sse_event
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_SEARCH
 from src.schema.catalog.actors import (
     ActorDetailResource,
     ActorJavdbSearchRequest,
@@ -18,7 +19,11 @@ from src.service.catalog import ActorService
 router = APIRouter(
     prefix="/actors",
     tags=["actors"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_SEARCH)),
+    ],
 )
 
 

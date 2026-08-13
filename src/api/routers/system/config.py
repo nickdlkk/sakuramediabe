@@ -2,14 +2,14 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends
 
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_admin_dependency
 from src.schema.system.config import ConfigResource, ConfigUpdateResource
 from src.service.system.config_service import ConfigService
 
 router = APIRouter(
     prefix="/config",
     tags=["config"],
-    dependencies=[Depends(db_deps)],
+    dependencies=[Depends(db_deps), Depends(require_admin_dependency)],
 )
 
 

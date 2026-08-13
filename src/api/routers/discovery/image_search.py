@@ -12,14 +12,19 @@ from fastapi import (
 )
 
 from src.api.routers._utils import parse_csv_positive_ints
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_SEARCH
 from src.schema.discovery import ImageSearchSessionPageResource
 from src.service.discovery import get_image_search_service
 
 router = APIRouter(
     prefix="/image-search",
     tags=["image-search"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_SEARCH)),
+    ],
 )
 
 

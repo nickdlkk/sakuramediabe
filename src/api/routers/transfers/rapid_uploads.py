@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query, status
 
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_DOWNLOAD_MANAGEMENT
 from src.schema.common.pagination import PageResponse
 from src.schema.transfers.rapid_upload import (
     MediaRapidUploadBatchListItemResource,
@@ -13,7 +14,11 @@ from src.service.transfers.rapid_upload.facade import MediaRapidUploadService
 router = APIRouter(
     prefix="/media/rapid-uploads",
     tags=["transfers"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_DOWNLOAD_MANAGEMENT)),
+    ],
 )
 
 

@@ -1,6 +1,12 @@
 from fastapi import APIRouter, Depends, Query, status
 
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import (
+    db_deps,
+    get_current_user,
+    require_admin_dependency,
+    require_module_dependency,
+)
+from src.model.system.user import MODULE_MEDIA_LIBRARIES
 from src.schema.playback.cloud115_libraries import (
     Cloud115BrowseResponse,
     Cloud115LibraryCreateRequest,
@@ -19,13 +25,21 @@ router = APIRouter(
 )
 
 
-@router.post("/qrlogin/token", response_model=Cloud115QrTokenResource)
+@router.post(
+    "/qrlogin/token",
+    response_model=Cloud115QrTokenResource,
+    dependencies=[Depends(require_admin_dependency)],
+)
 async def get_qrlogin_token(current_user=Depends(get_current_user)):
     """建一次扫码会话，返回 uid/time/sign + 二维码 PNG (base64)。"""
     return await Cloud115QrLoginService.get_token()
 
 
-@router.post("/qrlogin/status", response_model=Cloud115QrStatusResource)
+@router.post(
+    "/qrlogin/status",
+    response_model=Cloud115QrStatusResource,
+    dependencies=[Depends(require_admin_dependency)],
+)
 async def poll_qrlogin_status(
     payload: Cloud115QrStatusRequest,
     current_user=Depends(get_current_user),
@@ -38,6 +52,7 @@ async def poll_qrlogin_status(
     "",
     response_model=MediaLibraryResource,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin_dependency)],
 )
 async def create_cloud115_library(
     payload: Cloud115LibraryCreateRequest,
@@ -50,6 +65,7 @@ async def create_cloud115_library(
 @router.post(
     "/{library_id}/reauth",
     response_model=MediaLibraryResource,
+    dependencies=[Depends(require_admin_dependency)],
 )
 async def reauth_cloud115_library(
     library_id: int,
@@ -60,7 +76,11 @@ async def reauth_cloud115_library(
     return await MediaLibraryService.reauth_cloud115_library(library_id, payload)
 
 
-@router.get("/{library_id}/entries", response_model=Cloud115BrowseResponse)
+@router.get(
+    "/{library_id}/entries",
+    response_model=Cloud115BrowseResponse,
+    dependencies=[Depends(require_module_dependency(MODULE_MEDIA_LIBRARIES))],
+)
 async def browse_cloud115_directory(
     library_id: int,
     cid: str = Query(default="0"),

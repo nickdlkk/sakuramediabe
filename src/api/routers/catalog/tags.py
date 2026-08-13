@@ -2,7 +2,8 @@
 from fastapi import APIRouter, Depends, Query
 
 from src.api.routers._utils import parse_optional_exact_text
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_SEARCH
 from src.schema.catalog.movies import (
     MovieCollectionType,
     MovieListItemResource,
@@ -16,7 +17,11 @@ from src.service.catalog import TagService
 router = APIRouter(
     prefix="/tags",
     tags=["tags"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_SEARCH)),
+    ],
 )
 
 

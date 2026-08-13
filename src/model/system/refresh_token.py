@@ -1,13 +1,15 @@
-from peewee import CharField, DateTimeField
+from peewee import CharField, DateTimeField, ForeignKeyField
 
 from src.model.base import BaseModel
 from src.model.enums import RefreshTokenStatus
 from src.model.mixins import TimestampedMixin
+from src.model.system.user import User
 
 
 class UserRefreshToken(TimestampedMixin, BaseModel):
     token_id = CharField(unique=True, index=True)
     token_hash = CharField()
+    user = ForeignKeyField(User, null=True, index=True, on_delete="CASCADE")
     status = CharField(max_length=32, default=RefreshTokenStatus.ACTIVE.value)
     expires_at = DateTimeField()
     revoked_at = DateTimeField(null=True)

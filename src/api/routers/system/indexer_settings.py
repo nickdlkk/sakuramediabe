@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_admin_dependency
 from src.schema.system.indexer_settings import (
     IndexerConnectionTestResponse,
     IndexerSettingsResource,
@@ -11,7 +11,7 @@ from src.service.system.indexer_settings_service import IndexerSettingsService
 router = APIRouter(
     prefix="/indexer-settings",
     tags=["indexer-settings"],
-    dependencies=[Depends(db_deps)],
+    dependencies=[Depends(db_deps), Depends(require_admin_dependency)],
 )
 
 

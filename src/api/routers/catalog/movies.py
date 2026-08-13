@@ -7,7 +7,8 @@ from src.api.routers._utils import (
     sse_streaming_response,
     to_sse_event,
 )
-from src.api.routers.deps import db_deps, get_current_user
+from src.api.routers.deps import db_deps, get_current_user, require_module_dependency
+from src.model.system.user import MODULE_SEARCH
 from src.metadata._providers.models import JavdbMovieReviewResource
 from src.schema.catalog.movies import (
     MovieCollectionMarkRequest,
@@ -42,7 +43,11 @@ from src.service.discovery import MovieRecommendationService
 router = APIRouter(
     prefix="/movies",
     tags=["movies"],
-    dependencies=[Depends(db_deps), Depends(get_current_user)],
+    dependencies=[
+        Depends(db_deps),
+        Depends(get_current_user),
+        Depends(require_module_dependency(MODULE_SEARCH)),
+    ],
 )
 
 
