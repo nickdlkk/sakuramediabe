@@ -2,6 +2,7 @@ import bcrypt
 from loguru import logger
 
 from src.config import settings
+from src.model.system.user import ALL_MODULES, USER_ROLE_ADMIN
 from src.model import (
     FOUR_K_PLAYLIST_DESCRIPTION,
     FOUR_K_PLAYLIST_NAME,
@@ -127,6 +128,8 @@ def init_user() -> bool:
     User.create(
         username=username,
         password_hash=hash_password,
+        role=USER_ROLE_ADMIN,
+        permissions=list(ALL_MODULES),
     )
     return True
 

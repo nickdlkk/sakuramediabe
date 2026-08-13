@@ -128,10 +128,24 @@ class AuthService:
         return user
 
     @staticmethod
+    def require_admin(user: User) -> None:
+        """校验当前用户为管理员，否则抛出 403。"""
+        if not user.is_admin:
+            raise ApiError(403, "forbidden", "Admin privileges required")
+
+    @staticmethod
+    def require_module(user: User, module: str) -> None:
+        """校验当前用户拥有指定功能模块权限，否则抛出 403。"""
+        if not user.has_module(module):
+            raise ApiError(403, "forbidden", f"Module permission required: {module}")
+
+    @staticmethod
     def _create_access_token(user: User, expires_at: datetime) -> str:
         payload = {
             "sub": str(user.id),
             "type": "access",
+            "role": user.role,
+            "permissions": user.permissions or [],
             "exp": int(expires_at.timestamp()),
         }
         return jwt.encode(

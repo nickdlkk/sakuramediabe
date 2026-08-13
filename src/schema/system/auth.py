@@ -1,5 +1,6 @@
 from datetime import datetime
 
+from src.model.system.user import USER_ROLE_USER
 from src.schema.common.base import SchemaModel
 
 
@@ -14,6 +15,8 @@ class TokenRefreshRequest(SchemaModel):
 
 class AuthUserSummary(SchemaModel):
     username: str
+    role: str = USER_ROLE_USER
+    permissions: list[str] | None = None
 
 
 class TokenResource(SchemaModel):

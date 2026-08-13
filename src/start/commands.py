@@ -589,6 +589,7 @@ def reset_account(username: str, password: str):
 
     from src.model import User, UserRefreshToken
     from src.model.base import get_database
+    from src.model.system.user import ALL_MODULES, USER_ROLE_ADMIN
 
     normalized_username = username.strip()
     if not normalized_username:
@@ -611,6 +612,8 @@ def reset_account(username: str, password: str):
         new_user = User.create(
             username=normalized_username,
             password_hash=password_hash,
+            role=USER_ROLE_ADMIN,
+            permissions=list(ALL_MODULES),
         )
 
     logger.info(
