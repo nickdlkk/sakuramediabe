@@ -10,6 +10,8 @@
    读的是同一个"活跃任务"集合，两边一旦脱节就会出现"页面说缺资源、调度说别搜"。
 """
 
+import json
+
 import pytest
 
 from src.common.media_import_status import (
@@ -18,7 +20,14 @@ from src.common.media_import_status import (
     IMPORT_STATUS_PENDING,
     IMPORT_STATUS_RUNNING,
 )
-from src.model import DownloadClient, DownloadTask, Media, MediaLibrary, Movie
+from src.model import (
+    DownloadClient,
+    DownloadTask,
+    ImportJob,
+    Media,
+    MediaLibrary,
+    Movie,
+)
 from src.schema.catalog.subscriptions import MovieSubscriptionStatus
 from src.service.catalog import MovieSubscriptionService
 
@@ -85,6 +94,61 @@ def test_finished_import_without_media_is_import_failed(client, import_status):
     )
 
     assert _status_of("ABP-001") == MovieSubscriptionStatus.IMPORT_FAILED.value
+
+
+def test_zero_output_import_operation_is_marked_no_media(client):
+    _subscribe("ABP-005")
+    task = _task(
+        client,
+        "ABP-005",
+        download_state="completed",
+        import_status=IMPORT_STATUS_COMPLETED,
+    )
+    ImportJob.create(
+        source_path="cloud115:source-005",
+        source_cid="source-005",
+        library=client.media_library,
+        download_task=task,
+        state="completed",
+        imported_count=0,
+        skipped_count=6,
+        failed_count=0,
+        failed_files=json.dumps([{"path": "sample.mp4", "reason": "file_too_small"}]),
+    )
+
+    operation = MovieSubscriptionService._load_latest_import_operations(
+        ["ABP-005"]
+    )["ABP-005"]
+
+    assert operation.outcome == "no_media"
+
+
+def test_malformed_failed_files_json_shape_does_not_break_import_operation(client):
+    _subscribe("ABP-006")
+    task = _task(
+        client,
+        "ABP-006",
+        download_state="completed",
+        import_status=IMPORT_STATUS_COMPLETED,
+    )
+    ImportJob.create(
+        source_path="cloud115:source-006",
+        source_cid="source-006",
+        library=client.media_library,
+        download_task=task,
+        state="completed",
+        imported_count=0,
+        skipped_count=0,
+        failed_count=0,
+        failed_files="null",
+    )
+
+    operation = MovieSubscriptionService._load_latest_import_operations(
+        ["ABP-006"]
+    )["ABP-006"]
+
+    assert operation.retryable_file_count == 0
+    assert operation.failure_reason is None
 
 
 @pytest.mark.parametrize(
@@ -323,51 +387,3 @@ def test_search_state_branches_map_kernel_vocabulary(client):
     assert _status_of("SRCH-003") == MovieSubscriptionStatus.FAILED.value
     assert _status_of("SRCH-004") == MovieSubscriptionStatus.MISSING.value
     assert _status_of("SRCH-005") == MovieSubscriptionStatus.PENDING.value
-
-
-def test_import_failed_rows_carry_latest_import_operation(client):
-    """import_failed 档装饰最新导入作业上下文（Wave 3）：
-    有 kind=file 失败项 → retry_failed_files + rerun；completed 零产出 → 仅 rerun。"""
-    import json
-
-    from src.model import ImportJob
-
-    _subscribe("IOPS-001")
-    retry_task = _task(client, "IOPS-001", download_state="completed", import_status=IMPORT_STATUS_FAILED)
-    ImportJob.create(
-        source_path="/downloads/IOPS-001",
-        library=client.media_library,
-        download_task=retry_task,
-        state="failed",
-        failed_count=2,
-        failed_files=json.dumps(
-            [
-                {"path": "/downloads/IOPS-001/a.mkv", "reason": "movie_number_unrecognized", "kind": "file"},
-                {"path": "/downloads/IOPS-001", "reason": "import_job_crashed", "kind": "job"},
-            ]
-        ),
-    )
-    _subscribe("IOPS-002")
-    zero_task = _task(client, "IOPS-002", download_state="completed", import_status=IMPORT_STATUS_COMPLETED)
-    ImportJob.create(
-        source_path="/downloads/IOPS-002",
-        library=client.media_library,
-        download_task=zero_task,
-        state="completed",
-        skipped_count=3,
-        failed_files="[]",
-    )
-
-    page = MovieSubscriptionService.list_subscriptions(page=1, page_size=50)
-    by_number = {item.movie_number: item for item in page.items}
-
-    retry_op = by_number["IOPS-001"].import_operation
-    assert retry_op is not None
-    assert retry_op.retryable_file_count == 1
-    assert retry_op.available_actions == ["open_import_job", "retry_failed_files", "rerun_import"]
-
-    zero_op = by_number["IOPS-002"].import_operation
-    assert zero_op is not None
-    assert zero_op.retryable_file_count == 0
-    # 零产出没有可重导文件：能做的是整作业重跑，绝不伪造 retry 按钮。
-    assert zero_op.available_actions == ["open_import_job", "rerun_import"]

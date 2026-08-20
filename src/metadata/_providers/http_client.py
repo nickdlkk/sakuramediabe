@@ -18,23 +18,20 @@ class MetadataRequestClient:
 
     def __init__(
         self,
-        proxy: str | None = None,
         *,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ):
-        client_kwargs: dict[str, Any] = {"trust_env": False}
-        if proxy:
-            client_kwargs["proxy"] = proxy
-        self.proxy = proxy
+        # trust_env 保持默认 True：未显式配置 proxy，请求统一跟随容器环境变量
+        # （HTTP_PROXY / HTTPS_PROXY / NO_PROXY），由部署方自行决定哪些请求走代理；
+        # 显式代理配置已整体移除，不再支持 config 层代理。
         self.timeout = timeout
         self.max_retries = max_retries
-        self.client = httpx.Client(timeout=timeout, **client_kwargs)
+        self.client = httpx.Client(timeout=timeout)
         logger.info(
-            "MetadataRequestClient initialized timeout={} max_retries={} proxy_enabled={}",
+            "MetadataRequestClient initialized timeout={} max_retries={}",
             timeout,
             max_retries,
-            bool(proxy),
         )
 
     def request_json(self, method: str, url: str, *, data: dict[str, Any] | None = None, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:

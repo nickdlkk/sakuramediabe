@@ -201,6 +201,9 @@ class DownloadCandidateCreatePayload(SchemaModel):
     seeders: int
     magnet_url: str = ""
     torrent_url: str = ""
+    # 选种阶段已知的种子身份（torznab infohash / 磁力链）。为空时提交链路会在内容闸门
+    # 解析 .torrent 后补全，不要求调用方一定给。
+    info_hash: str = ""
     tags: list[str] = []
 
 
@@ -250,10 +253,9 @@ class DownloadTaskResource(SchemaModel):
             "updated_at": task.updated_at,
         }
         if movie is not None:
-            # 中文标题优先，回落到原始标题；两者都为空时保持 None（前端会 fallback 到 task.name）。
-            title_zh = (movie.title_zh or "").strip()
+            # 标题为空串时保持 None（前端会 fallback 到 task.name）。
             title = (movie.title or "").strip()
-            data["movie_title"] = title_zh or title or None
+            data["movie_title"] = title or None
             # cover_image 是可空 FK；有值才组装 ImageResource，让签名逻辑走 field_validator。
             if movie.cover_image is not None:
                 data["movie_cover"] = ImageResource.from_attributes_model(movie.cover_image)
@@ -277,9 +279,6 @@ class DownloadTasksQuery(SchemaModel):
     page_size: int = Field(default=20, ge=1, le=100)
     client_id: int | None = Field(default=None, gt=0)
     movie_number: str | None = None
-    # 按下载状态筛选，支持多值（重复参数，如 ?download_state=downloading&download_state=stalled）。
-    # 取值集合与 ALLOWED_DOWNLOAD_STATES 一致；空列表 / 未传表示不过滤。
-    download_state: list[str] | None = None
     sort: str | None = None
 
 
@@ -332,3 +331,20 @@ class DownloadTaskImportResponse(SchemaModel):
     import_job_id: int
     task_run_id: int
     status: str
+
+
+class DownloadTaskFileResource(SchemaModel):
+    """下载任务里的单个文件（qB / 115 统一归一化后的结构）。"""
+
+    name: str
+    size: int
+    # 115 侧目录条目用 is_dir 区分；qB 的文件列表恒为文件。
+    is_dir: bool = False
+    # 115 相对任务目录的路径（qB 直接给种子内路径，与 name 相同，置 None 少带冗余）。
+    path: str | None = None
+
+
+class DownloadTaskFilesResponse(SchemaModel):
+    task_id: int
+    client_kind: str
+    files: list[DownloadTaskFileResource] = []

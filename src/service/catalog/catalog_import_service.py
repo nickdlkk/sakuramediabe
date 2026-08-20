@@ -2,22 +2,19 @@
 
 负责把 JavDB 返回的影片/演员详情转换成本地目录数据。图片下载与图片记录持久化已抽到
 ``MovieImageService``，本 service 只做元数据编排，图片相关能力统一委托 ``self.image_service``。
-阅读入口建议从 ``upsert_movie_from_javdb_detail`` 开始。
+阅读入口建议从导入语义的三个方法开始：
+``import_movie_if_missing``（纯新建）、``refresh_movie_metadata_strict``（纯覆盖）、
+``update_movie_fields``（指定字段更新）。
 """
 
 from collections.abc import Callable
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 from loguru import logger
 
 from src.common.runtime_time import utc_now_for_db
-from src.metadata._providers.dmm import (
-    DmmMovieDescNotFoundError,
-    DmmMovieNumberNotFoundError,
-    DmmProvider,
-)
-from src.metadata._providers.exceptions import MetadataRequestError
 from src.metadata._providers.models import (
     JavdbMovieActorResource,
     JavdbMovieDetailResource,
@@ -33,6 +30,7 @@ from src.model import (
     Tag,
     get_database,
 )
+from src.model.catalog.movies import PROTECTED_MOVIE_FIELDS
 from src.service.catalog.movie_collection_service import MovieCollectionService
 from src.service.catalog.movie_heat_service import MovieHeatService
 from src.service.catalog.movie_image_service import (
@@ -42,14 +40,7 @@ from src.service.catalog.movie_image_service import (
     PreparedImageFile,
     ThinCoverResolution,
 )
-from src.service.system.resource_task_runner import (
-    STATE_FAILED_TERMINAL,
-    ResourceTaskLedger,
-    RetryPolicy,
-    TaskAbortError,
-    TaskItemError,
-)
-from src.service.system.resource_task_state_service import ResourceTaskStateService
+from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
 
 # 兼容既有导入路径：ImageDownloadError 等类型历史上从本模块导出，且多处 `except ImageDownloadError`
 # 依赖同一个类对象，这里显式再导出保证类身份唯一。
@@ -64,36 +55,15 @@ __all__ = [
 
 class CatalogImportService:
     """承接远端元数据到本地目录模型的 upsert。"""
-    TASK_KEY = "movie_desc_sync"
-
-    # DMM 简介为次要补充：连续请求失败到达该阈值即判定 DMM 当前不可用，
-    # 本 service 实例后续直接跳过抓取，避免每部影片都重复走超时+重试拖慢同步。
-    DMM_UNAVAILABLE_FAILURE_THRESHOLD = 3
-
-    # movie_desc_sync 重试预算（kernel 记账）：网络性失败按小时级指数退避，
-    # 5 次后 exhausted；DMM 确认无此番号/无简介为 failed_terminal 不进预算。
-    DESC_SYNC_RETRY_POLICY = RetryPolicy(
-        max_attempts=5, backoff_base_seconds=3600, backoff_max_seconds=86400
-    )
 
     def __init__(
         self,
         image_downloader: Callable[[str, Path], None] | None = None,
         persist_lock=None,
-        dmm_provider: DmmProvider | None = None,
     ):
         # 图片子系统统一交由 MovieImageService，downloader 透传下去保住 media_import 的注入接缝。
         self.image_service = MovieImageService(image_downloader=image_downloader)
         self.persist_lock = persist_lock
-        self.dmm_provider = dmm_provider or self._build_dmm_provider()
-        # DMM 熔断状态：连续连通性失败计数与是否已判定不可用（仅在本实例生命周期内有效）。
-        self._dmm_request_failures = 0
-        self._dmm_circuit_open = False
-
-    @staticmethod
-    def _build_dmm_provider() -> DmmProvider:
-        from src.metadata.factory import build_dmm_provider
-        return build_dmm_provider()
 
     @staticmethod
     def _split_actor_alias_name(alias_name: str) -> list[str]:
@@ -150,17 +120,36 @@ class CatalogImportService:
             return set()
         return self.image_service.delete_image_record_if_unused(old_thin_cover_image)
 
-    def upsert_movie_from_javdb_detail(
+    def import_movie_if_missing(
         self,
         detail: JavdbMovieDetailResource,
         force_subscribed: bool = False,
-    ) -> Movie:
-        """把一份 JavDB 影片详情完整落到本地 Movie/Actor/Tag/Image 关系中。"""
+    ) -> tuple[Movie, bool]:
+        """纯新建语义：影片已存在（movie_number 或 javdb_id 命中）时跳过，不写任何字段。
+
+        返回 ``(movie, created)``。已存在影片的元数据刷新唯一入口是
+        ``refresh_movie_metadata_strict``（手动刷新接口）；指定字段更新走
+        ``update_movie_fields``。
+        """
+        # 快路径：已存在直接返回，零图片 IO。图片下载期间可能被并发导入抢先建好，
+        # 事务内会二次确认（图片路径按番号确定性派生，双方下载内容一致，无孤儿文件问题）。
+        existing_movie = Movie.get_or_none(
+            (Movie.movie_number == detail.movie_number)
+            | (Movie.javdb_id == detail.javdb_id)
+        )
+        if existing_movie is not None:
+            logger.debug(
+                "Catalog import skipped existing movie movie_id={} movie_number={}",
+                existing_movie.id,
+                existing_movie.movie_number,
+            )
+            return existing_movie, False
+
         actors = detail.actors or []
         tags = detail.tags or []
         plot_images = detail.plot_images or []
         logger.info(
-            "Catalog upsert start movie_number={} javdb_id={} actors={} tags={} plot_images={}",
+            "Catalog import start movie_number={} javdb_id={} actors={} tags={} plot_images={}",
             detail.movie_number,
             detail.javdb_id,
             len(actors),
@@ -170,7 +159,7 @@ class CatalogImportService:
         plot_urls = self._unique_preserve_order(plot_images)
         if len(plot_urls) != len(plot_images):
             logger.debug(
-                "Catalog upsert deduplicated plot images movie_number={} original={} deduplicated={}",
+                "Catalog import deduplicated plot images movie_number={} original={} deduplicated={}",
                 detail.movie_number,
                 len(plot_images),
                 len(plot_urls),
@@ -199,17 +188,24 @@ class CatalogImportService:
         lock_context = self.persist_lock or nullcontext()
         obsolete_paths: set[str] = set()
         with lock_context, get_database().atomic():
-            # movie_number 和 javdb_id 任一命中都视为同一影片，保证重复导入时走更新。
-            movie = Movie.get_or_none((Movie.movie_number == detail.movie_number) | (Movie.javdb_id == detail.javdb_id))
-            created_movie = movie is None
-            if movie is None:
-                movie = Movie(
-                    movie_number=detail.movie_number,
-                    javdb_id=detail.javdb_id,
-                    title=detail.title,
+            # 二次确认：图片下载期间并发导入可能已建好该影片，此时跳过写入。
+            movie = Movie.get_or_none(
+                (Movie.movie_number == detail.movie_number)
+                | (Movie.javdb_id == detail.javdb_id)
+            )
+            if movie is not None:
+                logger.debug(
+                    "Catalog import concurrent created movie movie_id={} movie_number={}",
+                    movie.id,
+                    movie.movie_number,
                 )
-            old_thin_cover_image = movie.thin_cover_image
-            was_subscribed = bool(movie.is_subscribed)
+                return movie, False
+            movie = Movie(
+                movie_number=detail.movie_number,
+                javdb_id=detail.javdb_id,
+                title=detail.title,
+            )
+            # 纯新建路径：无旧封面/订阅状态可继承，直接按详情写入。
             target_is_subscribed = True if force_subscribed else detail.is_subscribed
 
             if cover_task is not None:
@@ -229,8 +225,7 @@ class CatalogImportService:
             if target_is_subscribed is not None:
                 movie.is_subscribed = target_is_subscribed
                 if target_is_subscribed:
-                    if not was_subscribed or movie.subscribed_at is None:
-                        movie.subscribed_at = utc_now_for_db()
+                    movie.subscribed_at = utc_now_for_db()
                 else:
                     movie.subscribed_at = None
             movie.extra = detail.extra
@@ -244,10 +239,9 @@ class CatalogImportService:
                 )
             movie.save()
             logger.debug(
-                "Catalog upsert movie saved movie_id={} movie_number={} created={}",
+                "Catalog import movie saved movie_id={} movie_number={}",
                 movie.id,
                 movie.movie_number,
-                created_movie,
             )
 
             # 演员、标签、剧照关系都使用 get_or_create，避免多次导入产生重复关联。
@@ -258,7 +252,7 @@ class CatalogImportService:
                 )
                 MovieActor.get_or_create(movie=movie, actor=actor)
                 logger.debug(
-                    "Catalog upsert actor linked movie_id={} actor_id={} actor_javdb_id={}",
+                    "Catalog import actor linked movie_id={} actor_id={} actor_javdb_id={}",
                     movie.id,
                     actor.id,
                     actor.javdb_id,
@@ -267,7 +261,12 @@ class CatalogImportService:
             for tag_resource in tags:
                 tag, _ = Tag.get_or_create(name=tag_resource.name)
                 MovieTag.get_or_create(movie=movie, tag=tag)
-                logger.debug("Catalog upsert tag linked movie_id={} tag_id={} tag_name={}", movie.id, tag.id, tag.name)
+                logger.debug(
+                    "Catalog import tag linked movie_id={} tag_id={} tag_name={}",
+                    movie.id,
+                    tag.id,
+                    tag.name,
+                )
 
             plot_images_by_index: dict[int, Image] = {}
             # 剧照整批一次 upsert，避免逐张 get_or_none + create 的 2N 次往返。
@@ -279,7 +278,7 @@ class CatalogImportService:
                         plot_images_by_index[int(plot_task.plot_index)] = plot_image
                     MoviePlotImage.get_or_create(movie=movie, image=plot_image)
                     logger.debug(
-                        "Catalog upsert plot image linked movie_id={} image_id={} index={}",
+                        "Catalog import plot image linked movie_id={} image_id={} index={}",
                         movie.id,
                         plot_image.id,
                         plot_task.plot_index,
@@ -287,7 +286,7 @@ class CatalogImportService:
             obsolete_paths.update(
                 self._apply_thin_cover_resolution(
                     movie,
-                    old_thin_cover_image,
+                    None,
                     thin_cover_resolution,
                     plot_images_by_index,
                     refreshed=False,
@@ -296,17 +295,99 @@ class CatalogImportService:
 
         self.image_service.delete_obsolete_image_files(obsolete_paths)
         MovieHeatService.update_single_movie_heat(movie.id)
-        # 主入库先完成，再补 DMM 描述，避免第三方页面波动影响影片基础数据入库。
-        self.sync_movie_desc(movie)
-        logger.info("Catalog upsert finished movie_id={} movie_number={}", movie.id, movie.movie_number)
-        return movie
+        logger.info(
+            "Catalog import finished movie_id={} movie_number={}",
+            movie.id,
+            movie.movie_number,
+        )
+        return movie, True
+
+    # ③ 允许更新的字段白名单 -> detail 取值器；heat 是推导列不允许直接写，
+    # 图片/演员/标签/剧照等关联字段不在本机制内（新建时由 import_movie_if_missing 完整导入）。
+    _MOVIE_FIELD_UPDATE_MAP: dict[str, Callable[[JavdbMovieDetailResource], Any]] = {
+        "score": lambda detail: detail.score or 0,
+        "score_number": lambda detail: detail.score_number,
+        "watched_count": lambda detail: detail.watched_count,
+        "want_watch_count": lambda detail: detail.want_watch_count,
+        "comment_count": lambda detail: detail.comment_count,
+        "title": lambda detail: detail.title,
+        "summary": lambda detail: detail.summary,
+        "maker_name": lambda detail: detail.maker_name,
+        "director_name": lambda detail: detail.director_name,
+    }
+
+    def update_movie_fields(
+        self,
+        detail: JavdbMovieDetailResource,
+        fields: tuple[str, ...],
+    ) -> tuple[Movie, bool, tuple[str, ...]]:
+        """指定字段更新：影片不存在先完整导入（import_movie_if_missing），存在则只更新指定字段。
+
+        返回 ``(movie, created, updated_fields)``，updated_fields 是实际发生变化的字段
+        （变更检测：值一致的字段跳过不写）；heat 联动由调用方负责（本方法不感知热度公式）。
+        """
+        if not fields:
+            raise ValueError("fields 不能为空")
+        normalized_fields = tuple(dict.fromkeys(fields))
+        invalid_fields = sorted(set(normalized_fields) - set(self._MOVIE_FIELD_UPDATE_MAP))
+        if invalid_fields:
+            raise ValueError(f"不支持的字段: {', '.join(invalid_fields)}")
+        movie, created = self.import_movie_if_missing(detail)
+        # 变更检测：只写值真正变化的字段，避免无意义 UPDATE，也支撑调用方的 updated/unchanged 计数。
+        previous_values: dict[str, Any] = {}
+        changed_fields: list[str] = []
+        for field_name in normalized_fields:
+            target_value = self._MOVIE_FIELD_UPDATE_MAP[field_name](detail)
+            previous_value = getattr(movie, field_name)
+            if previous_value == target_value:
+                continue
+            previous_values[field_name] = previous_value
+            setattr(movie, field_name, target_value)
+            changed_fields.append(field_name)
+        if changed_fields:
+            # 受保护字段（白名单内，如 title/summary）分流到唯一写入网关，宿主侧
+            # 只更新未接管字段；其余字段保持窄更新。已持久化对象不能裸 save（护栏）。
+            protected_changed = [
+                field_name
+                for field_name in changed_fields
+                if field_name in PROTECTED_MOVIE_FIELDS
+            ]
+            host_changed = [
+                field_name
+                for field_name in changed_fields
+                if field_name not in PROTECTED_MOVIE_FIELDS
+            ]
+            if host_changed:
+                movie.save(
+                    only=[Movie._meta.fields[field_name] for field_name in host_changed]
+                )
+            if protected_changed:
+                MovieOwnershipGateway.update_host_unowned(
+                    movie.id,
+                    {
+                        field_name: getattr(movie, field_name)
+                        for field_name in protected_changed
+                    },
+                )
+                # 被插件接管的字段未落库：重读该行并把实际落库变更回流到结果，
+                # 保证返回对象与库内真实状态一致、updated 字段不虚报。
+                movie = Movie.get_by_id(movie.id)
+                changed_fields = [
+                    field_name
+                    for field_name in changed_fields
+                    if getattr(movie, field_name) != previous_values[field_name]
+                ]
+        return movie, created, tuple(changed_fields)
 
     def refresh_movie_metadata_strict(
         self,
         movie: Movie,
         detail: JavdbMovieDetailResource,
     ) -> Movie:
-        """按远端详情严格刷新影片元数据，不触碰描述、订阅与番号字段。"""
+        """纯覆盖语义：按远端详情全量覆盖已存在影片的元数据（含 title/summary/互动数/图片/演员/标签），不触碰订阅与番号字段。
+
+        是已存在影片元数据刷新的唯一入口（手动刷新接口），影片必须已存在。
+        """
         actors = detail.actors or []
         tags = detail.tags or []
         plot_images = detail.plot_images or []
@@ -362,113 +443,6 @@ class CatalogImportService:
             if not finalized:
                 self.image_service.cleanup_prepared_image_files(prepared_files)
 
-    def sync_movie_desc(self, movie: Movie) -> bool:
-        """公共入口（热评同步、影片导入等 upsert 链路复用）：kernel 记账的单资源执行。"""
-        task_state = ResourceTaskStateService.get_state(self.TASK_KEY, movie.id)
-        if task_state is not None and task_state.state == STATE_FAILED_TERMINAL:
-            # 终态必须在公共入口统一拦截，避免 upsert 链路绕过候选过滤反复请求 DMM。
-            logger.info(
-                "Catalog movie desc sync skipped terminal failure movie_id={} movie_number={}",
-                movie.id,
-                movie.movie_number,
-            )
-            return False
-
-        # DMM 已在本实例生命周期内判定不可用：直接跳过，不发请求也不消耗预算，
-        # 状态保持原样，留待网络恢复后的定时任务补抓。
-        if self._dmm_circuit_open:
-            return False
-
-        from src.service.system.activity_service import ActivityService
-
-        run_context = ActivityService.get_task_run_context()
-        lock_context = self.persist_lock or nullcontext()
-        with lock_context:
-            claim = ResourceTaskLedger.begin_attempt(
-                task_key=self.TASK_KEY,
-                resource_type="movie",
-                resource_id=movie.id,
-                trigger_type=getattr(run_context, "trigger_type", None),
-                task_run_id=getattr(run_context, "task_run_id", None),
-            )
-        if claim is None:
-            # 行级领取失败：该影片正被其它 run（批跑/子集跑）抓取中，本次跳过。
-            logger.info(
-                "Catalog movie desc sync skipped, movie busy in another run movie_id={} movie_number={}",
-                movie.id,
-                movie.movie_number,
-            )
-            return False
-        attempt, record, _prior_state = claim
-        try:
-            movie_desc = self.fetch_movie_desc_strict(movie)
-        except TaskItemError as exc:
-            with lock_context:
-                ResourceTaskLedger.finish_failure(
-                    attempt,
-                    record,
-                    error_code=exc.error_code,
-                    error_message=str(exc),
-                    retryable=exc.retryable,
-                    policy=self.DESC_SYNC_RETRY_POLICY,
-                )
-            logger.warning(
-                "Catalog movie desc fetch failed movie_id={} movie_number={} code={} retryable={}",
-                movie.id,
-                movie.movie_number,
-                exc.error_code,
-                exc.retryable,
-            )
-            return False
-        with lock_context:
-            self._apply_movie_desc(movie, movie_desc)
-            ResourceTaskLedger.finish_success(attempt, record)
-        return True
-
-    def fetch_movie_desc_strict(self, movie: Movie) -> str:
-        """只抓不记账：维护熔断计数，失败一律抛带 error_code 的 TaskItemError。"""
-        try:
-            movie_desc = self.dmm_provider.get_movie_desc(movie.movie_number)
-        except DmmMovieNumberNotFoundError as exc:
-            # 业务性失败说明 DMM 仍可用：清零熔断计数，判终态。
-            self._dmm_request_failures = 0
-            raise TaskItemError(
-                "dmm_movie_number_not_found", str(exc), retryable=False
-            ) from exc
-        except DmmMovieDescNotFoundError as exc:
-            self._dmm_request_failures = 0
-            raise TaskItemError(
-                "dmm_movie_desc_not_found", str(exc), retryable=False
-            ) from exc
-        except MetadataRequestError as exc:
-            # 连通性失败（已重试耗尽）计入熔断。
-            self._dmm_request_failures += 1
-            if self._dmm_request_failures >= self.DMM_UNAVAILABLE_FAILURE_THRESHOLD:
-                self._dmm_circuit_open = True
-                logger.warning(
-                    "DMM marked unavailable after {} consecutive request failures, "
-                    "skip desc sync for the rest of this run",
-                    self._dmm_request_failures,
-                )
-            raise TaskItemError("dmm_request_error", str(exc)) from exc
-        except Exception as exc:
-            self._dmm_request_failures = 0
-            raise TaskItemError("dmm_fetch_failed", str(exc)) from exc
-        self._dmm_request_failures = 0
-        return movie_desc
-
-    def ensure_dmm_available_or_abort(self) -> None:
-        """cron runner 的逐资源前置检查：熔断已开则中止整轮（剩余资源不耗预算）。"""
-        if self._dmm_circuit_open:
-            raise TaskAbortError(
-                "dmm_unavailable", "DMM 连续请求失败已熔断，本轮剩余影片中止"
-            )
-
-    @staticmethod
-    def _apply_movie_desc(movie: Movie, movie_desc: str) -> None:
-        movie.desc = movie_desc
-        movie.save(only=[Movie.desc])
-
     def _refresh_movie_metadata_records_strict(
         self,
         *,
@@ -481,7 +455,14 @@ class CatalogImportService:
         plot_tasks: list[ImagePersistTask],
         actor_image_tasks_by_javdb_id: dict[str, ImagePersistTask],
     ) -> tuple[Movie, set[str]]:
-        movie = Movie.get_by_id(movie.id)
+        # 事务内先锁行重读（v2-lite 字段主权）：锁定期间当前 owner 状态稳定，
+        # 之后受保护字段写入以本次读取为准，杜绝旧快照覆盖插件刚写入的值。
+        movie = (
+            Movie.select()
+            .where(Movie.id == movie.id)
+            .for_update()
+            .get()
+        )
         obsolete_paths: set[str] = set()
 
         old_cover_image = movie.cover_image
@@ -531,7 +512,38 @@ class CatalogImportService:
         movie.javdb_id = detail.javdb_id
         movie.title = detail.title
         movie.cover_image = self.image_service.persist_refreshed_image_record(cover_task)
-        movie.save()
+
+        # 受保护字段（白名单内）不允许随宿主窄更新落库，改走唯一写入网关
+        # （update_host_unowned 只更新未接管字段）；其余字段显式窄更新。
+        host_field_names = (
+            "release_date",
+            "duration_minutes",
+            "score",
+            "score_number",
+            "watched_count",
+            "want_watch_count",
+            "comment_count",
+            "summary",
+            "series",
+            "maker_name",
+            "director_name",
+            "extra",
+            "javdb_id",
+            "title",
+            "cover_image",
+        )
+        protected_field_names = set(PROTECTED_MOVIE_FIELDS) & set(host_field_names)
+        narrow_columns = [
+            Movie._meta.fields[name]
+            for name in host_field_names
+            if name not in protected_field_names
+        ]
+        movie.save(only=narrow_columns)
+        if protected_field_names:
+            MovieOwnershipGateway.update_host_unowned(
+                movie.id,
+                {name: getattr(movie, name) for name in protected_field_names},
+            )
 
         seen_actor_ids: set[str] = set()
         for actor_resource in actors:
@@ -575,6 +587,9 @@ class CatalogImportService:
             )
         )
 
+        # 受保护字段可能未全部落库（被插件接管的字段保留插件值）：重读该行，
+        # 保证返回对象与库内真实状态一致（内存中的远端值不得外泄给调用方）。
+        movie = Movie.get_by_id(movie.id)
         return movie, obsolete_paths
 
     def _refresh_actor_from_javdb_resource_strict(

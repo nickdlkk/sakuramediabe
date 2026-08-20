@@ -3,6 +3,7 @@ import logging
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import click
 from loguru import logger
@@ -11,23 +12,16 @@ import src.common.logging as app_logging
 from src.api.exception.errors import ApiError
 from src.common.logging import configure_logging
 from src.config.config import settings
-from src.metadata.factory import build_dmm_provider, build_javdb_provider
+from src.metadata.factory import build_javdb_provider
 from src.metadata.provider import MetadataNotFoundError, MetadataRequestError
 from src.model import init_database
 from src.model.enums import MediaLibraryBackend
+from src.plugins.manager import PluginManager
 from src.scheduler.progress import TqdmProgressAdapter
-from src.scheduler.registry import JOB_REGISTRY
 from src.schema.playback.media_libraries import MediaLibraryCreateRequest
 from src.service.catalog import MovieThinCoverBackfillService
 from src.service.catalog.movie_asset_shard_migration_service import (
     MovieAssetShardMigrationService,
-)
-from src.service.catalog.movie_desc_translation_client import (
-    MovieDescTranslationClient,
-    MovieDescTranslationClientError,
-)
-from src.service.catalog.movie_desc_translation_test_support import (
-    DEFAULT_TEST_TRANSLATION_PROMPT,
 )
 from src.service.catalog.movie_subtitle_unify_migration_service import (
     MovieSubtitleUnifyMigrationService,
@@ -116,42 +110,6 @@ def _echo_json(payload: dict) -> None:
     click.echo(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-def _load_required_text_input(
-    *,
-    direct_value: str | None,
-    file_value: str | None,
-    direct_option_name: str,
-    file_option_name: str,
-) -> str:
-    # 文本输入要求二选一，避免命令在“直接传参”和“文件读入”之间出现歧义。
-    has_direct_value = bool((direct_value or "").strip())
-    has_file_value = bool((file_value or "").strip())
-    if has_direct_value == has_file_value:
-        raise click.ClickException(f"must provide exactly one of {direct_option_name} or {file_option_name}")
-    if has_direct_value:
-        return str(direct_value).strip()
-    return Path(str(file_value)).read_text(encoding="utf-8").strip()
-
-
-def _load_optional_text_input(
-    *,
-    direct_value: str | None,
-    file_value: str | None,
-    default_value: str,
-    direct_option_name: str,
-    file_option_name: str,
-) -> str:
-    has_direct_value = bool((direct_value or "").strip())
-    has_file_value = bool((file_value or "").strip())
-    if has_direct_value and has_file_value:
-        raise click.ClickException(f"cannot provide both {direct_option_name} and {file_option_name}")
-    if has_direct_value:
-        return str(direct_value).strip()
-    if has_file_value:
-        return Path(str(file_value)).read_text(encoding="utf-8").strip()
-    return default_value
-
-
 def _fail_command(*, output_json: bool, message: str, error: dict | None = None) -> None:
     normalized_message = str(message).strip()
     if output_json:
@@ -164,19 +122,6 @@ def _fail_command(*, output_json: bool, message: str, error: dict | None = None)
         _echo_json(payload)
         raise click.exceptions.Exit(1)
     raise click.ClickException(normalized_message)
-
-
-def _fail_for_translation_error(*, exc: MovieDescTranslationClientError, output_json: bool) -> None:
-    _fail_command(
-        output_json=output_json,
-        message=exc.message,
-        error={
-            "type": "translation_client_error",
-            "status_code": exc.status_code,
-            "error_code": exc.error_code,
-            "message": exc.message,
-        },
-    )
 
 
 def _fail_for_metadata_error(*, exc: Exception, output_json: bool) -> None:
@@ -314,93 +259,6 @@ def wait_db(timeout_seconds: float, interval_seconds: float):
         time.sleep(interval_seconds)
 
 
-@main.command(name="test-trans")
-@click.option("--text", type=str, help="Text to translate.")
-@click.option(
-    "--text-file",
-    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=str),
-    help="Read source text from file.",
-)
-@click.option("--prompt", type=str, help="Custom translation prompt.")
-@click.option(
-    "--prompt-file",
-    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=str),
-    help="Read custom prompt from file.",
-)
-@click.option("--base-url", type=str, help="Override translation base URL.")
-@click.option("--api-key", type=str, help="Override translation API key.")
-@click.option("--model", type=str, help="Override translation model.")
-@click.option("--json", "output_json", is_flag=True, help="Print structured JSON output.")
-def test_translation(
-    text: str | None,
-    text_file: str | None,
-    prompt: str | None,
-    prompt_file: str | None,
-    base_url: str | None,
-    api_key: str | None,
-    model: str | None,
-    output_json: bool,
-):
-    with _suppress_logs_for_json_output(output_json):
-        if not output_json:
-            logger.info(
-                "CLI test-trans start base_url={} model={}",
-                base_url or settings.movie_info_translation.base_url,
-                model or settings.movie_info_translation.model,
-            )
-        try:
-            source_text = _load_required_text_input(
-                direct_value=text,
-                file_value=text_file,
-                direct_option_name="--text",
-                file_option_name="--text-file",
-            )
-            system_prompt = _load_optional_text_input(
-                direct_value=prompt,
-                file_value=prompt_file,
-                default_value=DEFAULT_TEST_TRANSLATION_PROMPT,
-                direct_option_name="--prompt",
-                file_option_name="--prompt-file",
-            )
-        except click.ClickException as exc:
-            _fail_command(output_json=output_json, message=exc.message)
-            return
-
-        client = MovieDescTranslationClient(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-        )
-        try:
-            translated_text = client.translate(system_prompt=system_prompt, source_text=source_text)
-        except MovieDescTranslationClientError as exc:
-            _fail_for_translation_error(exc=exc, output_json=output_json)
-            return
-
-        payload = {
-            "ok": True,
-            "service": "translation",
-            "base_url": client.base_url,
-            "model": client.model,
-            "source_text": source_text,
-            "system_prompt": system_prompt,
-            "translated_text": translated_text,
-        }
-        _emit_command_success(
-            output_json=output_json,
-            payload=payload,
-            summary_title="translation test succeeded:",
-            inline_fields=[
-                ("base_url", client.base_url),
-                ("model", client.model),
-            ],
-            multiline_fields=[
-                ("source_text", source_text),
-                ("translated_text", translated_text),
-            ],
-        )
-
-
 @main.command(name="test-javdb")
 @click.option("--movie-number", required=True, type=str, help="Movie number to query from JavDB.")
 @click.option("--json", "output_json", is_flag=True, help="Print structured JSON output.")
@@ -442,36 +300,24 @@ def test_javdb(movie_number: str, output_json: bool):
         )
 
 
-@main.command(name="test-dmm")
-@click.option("--movie-number", required=True, type=str, help="Movie number to query from DMM.")
-@click.option("--json", "output_json", is_flag=True, help="Print structured JSON output.")
-def test_dmm(movie_number: str, output_json: bool):
-    with _suppress_logs_for_json_output(output_json):
-        if not output_json:
-            logger.info("CLI test-dmm start movie_number={}", movie_number)
-        provider = build_dmm_provider()
-        try:
-            description = provider.get_movie_desc(movie_number)
-        except (MetadataNotFoundError, MetadataRequestError) as exc:
-            _fail_for_metadata_error(exc=exc, output_json=output_json)
-            return
+class _LazyApsGroup(click.Group):
+    """APS 子命令组：首次调用时才从 JOB_REGISTRY 注册子命令。
 
-        payload = {
-            "ok": True,
-            "service": "dmm",
-            "movie_number": movie_number,
-            "description": description,
-        }
-        _emit_command_success(
-            output_json=output_json,
-            payload=payload,
-            summary_title="dmm test succeeded:",
-            inline_fields=[("movie_number", movie_number)],
-            multiline_fields=[("description", description)],
-        )
+    插件在 import 期加载有副作用（依赖安装、插件代码执行），插件管理 CLI
+    （plugins list/install 等）不应为此被迫加载全部插件，因此注册表访问
+    推迟到真正执行 APS 子命令时。
+    """
+
+    def invoke(self, ctx: click.Context) -> Any:
+        if not self.commands:
+            from src.scheduler.registry import JOB_REGISTRY
+
+            for job_def in JOB_REGISTRY:
+                _register_aps_command(job_def, group=self)
+        return super().invoke(ctx)
 
 
-@main.group(invoke_without_command=True)
+@main.group(cls=_LazyApsGroup, invoke_without_command=True)
 @click.pass_context
 def aps(ctx: click.Context):
     """定时任务相关命令"""
@@ -490,28 +336,167 @@ def aps(ctx: click.Context):
 # ---------------------------------------------------------------------------
 
 
-def _register_aps_command(job_def):
-    @aps.command(name=job_def.cli_name, help=job_def.cli_help)
-    def _cmd():
-        from src.start.aps import run_job
+def _run_cli_job(job_def, params=None):
+    from src.start.aps import run_job
 
-        adapter = TqdmProgressAdapter()
-        try:
-            stats = run_job(job_def, trigger_type="manual", extra_callbacks=[adapter.callback])
-        except TaskRunConflictError as exc:
-            raise click.ClickException(str(exc))
-        finally:
-            adapter.close()
-        if job_def.format_stats and isinstance(stats, dict):
-            click.echo(job_def.format_stats(stats))
-        else:
-            click.echo(f"{job_def.cli_name} finished: {stats}")
+    adapter = TqdmProgressAdapter()
+    try:
+        stats = run_job(
+            job_def,
+            trigger_type="manual",
+            params=params,
+            extra_callbacks=[adapter.callback],
+        )
+    except TaskRunConflictError as exc:
+        raise click.ClickException(str(exc))
+    finally:
+        adapter.close()
+    if job_def.format_stats and isinstance(stats, dict):
+        click.echo(job_def.format_stats(stats))
+    else:
+        click.echo(f"{job_def.cli_name} finished: {stats}")
 
-    return _cmd
+
+def _register_aps_command(job_def, group):
+    if job_def.manual_only and job_def.params_schema is None:
+        # 无参的 manual_only 任务只能走 HTTP 触发，CLI 无法表达触发参数。
+        return
+    if job_def.params_schema is None:
+        @group.command(name=job_def.cli_name, help=job_def.cli_help)
+        def _cmd():
+            _run_cli_job(job_def)
+
+        return
+
+    @group.command(name=job_def.cli_name, help=job_def.cli_help)
+    @click.option(
+        "--params-json",
+        required=job_def.manual_only,
+        default=None if job_def.manual_only else "{}",
+        help="任务参数 JSON，按任务声明的 params_schema 校验",
+    )
+    def _cmd_with_params(params_json):
+        payload = json.loads(params_json or "{}")
+        job_def.params_schema.model_validate(payload)
+        _run_cli_job(job_def, params=payload)
 
 
-for _job_def in JOB_REGISTRY:
-    _register_aps_command(_job_def)
+# ---------------------------------------------------------------------------
+# 插件管理 CLI
+# ---------------------------------------------------------------------------
+
+
+@main.group(name="plugins")
+def plugins_group():
+    """插件管理（目录/zip 安装：list/install/remove/enable/disable/check）。"""
+
+
+def _plugin_operation(operation):
+    try:
+        return operation()
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@plugins_group.command("list")
+def plugins_list():
+    """列出已安装插件。"""
+    for item in PluginManager().list_plugins():
+        error = f" error={item['load_error']}" if item["load_error"] else ""
+        click.echo(
+            f"{item['plugin_id']:<24} {item['display_name']} "
+            f"v{item['version']} enabled={str(item['enabled']).lower()} "
+            f"load={item['load_status']}{error}"
+        )
+
+
+@plugins_group.command("install")
+@click.argument("plugin_path", type=click.Path(exists=True, path_type=Path))
+@click.option("--sha256", default=None, help="zip 包 sha256（可选，校验完整性）")
+@click.option("--no-enable", is_flag=True, default=False, help="安装但不写入 enabled")
+def plugins_install(plugin_path: Path, sha256: str | None, no_enable: bool):
+    """把插件目录或 zip 包安装到插件根目录（重复安装保留 data/）。"""
+
+    def _install():
+        manager = PluginManager()
+        if plugin_path.suffix.lower() == ".zip":
+            return manager.install_zip(
+                plugin_path, sha256=sha256, enable=not no_enable
+            )
+        return manager.install(plugin_path, enable=not no_enable)
+
+    result = _plugin_operation(_install)
+    click.echo(
+        f"插件 {result['plugin_id']} v{result['version']} 已安装；"
+        "重启 api 与 aps 后生效"
+    )
+
+
+@plugins_group.command("remove")
+@click.argument("plugin_id")
+def plugins_remove(plugin_id: str):
+    """删除插件目录（含 data/，请先自行备份）。"""
+    _plugin_operation(lambda: PluginManager().remove(plugin_id))
+    click.echo(f"插件 {plugin_id} 已删除")
+
+
+@plugins_group.command("enable")
+@click.argument("plugin_id")
+def plugins_enable(plugin_id: str):
+    """启用插件（写入 enabled，重启后生效）。"""
+    _plugin_operation(lambda: PluginManager().set_enabled(plugin_id, True))
+    click.echo(f"插件 {plugin_id} 已启用；重启 api 与 aps 后生效")
+
+
+@plugins_group.command("disable")
+@click.argument("plugin_id")
+def plugins_disable(plugin_id: str):
+    """停用插件（从 enabled 移除，重启后生效）。"""
+    _plugin_operation(lambda: PluginManager().set_enabled(plugin_id, False))
+    click.echo(f"插件 {plugin_id} 已停用；重启 api 与 aps 后生效")
+
+
+@plugins_group.command("check")
+@click.argument("plugin_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+def plugins_check(plugin_dir: Path):
+    """校验插件目录（import + register + 契约），供插件作者使用。"""
+    from src.plugins.loader import check_plugin_dir
+
+    try:
+        check_plugin_dir(plugin_dir=plugin_dir)
+    except Exception as exc:
+        raise click.ClickException(f"插件校验失败: {exc}") from exc
+    click.echo(f"插件 {plugin_dir.name} 校验通过")
+
+
+@plugins_group.command("clear-field-owners")
+@click.option("--plugin-id", required=True, type=str, help="解除接管的目标插件 id。")
+@click.option(
+    "--field",
+    "fields",
+    multiple=True,
+    type=str,
+    help="只清除指定字段的 owner（可重复）；不传则清除该插件全部字段 owner。",
+)
+def plugins_clear_field_owners(plugin_id: str, fields: tuple[str, ...]):
+    """解除插件对 Movie 受保护字段的接管（插件被删除后其字段会冻结，用本命令释放回宿主）。"""
+    from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
+
+    _ensure_database_ready()
+    try:
+        affected = MovieOwnershipGateway.release_plugin_owners(
+            plugin_id,
+            fields=fields if fields else None,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    except Exception:
+        logger.exception("CLI plugins clear-field-owners crashed plugin_id={}", plugin_id)
+        raise
+    if fields:
+        click.echo(f"已解除插件 {plugin_id} 对字段 {', '.join(fields)} 的接管，共 {affected} 行")
+    else:
+        click.echo(f"已解除插件 {plugin_id} 的全部字段接管，共 {affected} 行")
 
 
 # ---------------------------------------------------------------------------

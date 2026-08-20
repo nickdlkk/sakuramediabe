@@ -25,28 +25,10 @@
 
 ## 当前已注册资源任务
 
-### `movie_desc_sync`
-
-- 资源类型：`movie`
-- 展示名称：`影片描述回填`
-- 适合展示的资源摘要字段：`movie_number`、`title`
-
 ### `movie_interaction_sync`
 
 - 资源类型：`movie`
 - 展示名称：`影片互动数同步`
-- 适合展示的资源摘要字段：`movie_number`、`title`
-
-### `movie_desc_translation`
-
-- 资源类型：`movie`
-- 展示名称：`影片简介翻译`
-- 适合展示的资源摘要字段：`movie_number`、`title`
-
-### `movie_title_translation`
-
-- 资源类型：`movie`
-- 展示名称：`影片标题翻译`
 - 适合展示的资源摘要字段：`movie_number`、`title`
 
 ### `media_thumbnail_generation`
@@ -84,7 +66,11 @@
   - `succeeded`
   - `failed`
 - `attempt_count`
-  - 当前资源任务记录累计尝试次数
+  - 本轮失败次数，延后不占用该计数
+- `deferred_count` / `deferred_limit`
+  - 延后进度，例如 `2/5`
+- `deferred_reason` / `next_retry_at`
+  - 暂缓原因与下次检查时间；`pending` 且这两个字段有效时展示“暂缓处理”
 - `last_attempted_at`
   - 最近一次开始执行时间
 - `last_succeeded_at`
@@ -202,9 +188,8 @@ GET /system/resource-task-states?task_key=media_thumbnail_generation&state=faile
   前端按 `accepted_resource_ids` 为空提示，而不是按请求失败处理
 - `retry_now` / `rerun` 返回 `task_run_id`，进度经任务中心和 `/system/events/stream` 跟进；
   连点会被 mutex 顶 `409`（单资源操作互斥到资源粒度，不同资源互不阻塞）
-- 影片页"翻译简介 / 同步互动数"按钮 = `rerun` + `resource_ids=[movie_id]`
-  （旧 `/movies/{movie_number}/desc-translation`、`/movies/{movie_number}/interaction-sync`
-  端点已删除；从未记账的影片后端会自动播种状态行）。`movie_id` 取影片详情 / 摘要响应的
+- 影片页"同步互动数"按钮 = `rerun` + `resource_ids=[movie_id]`
+  （旧 `/movies/{movie_number}/interaction-sync` 端点已删除；从未记账的影片后端会自动播种状态行）。`movie_id` 取影片详情 / 摘要响应的
   `id` 字段——`MovieListItemResource` 已统一带出它，所以榜单、播放列表、推荐等任何影片卡片
   列表都能直接发起操作
 - 订阅页"重新查询 / 重置全部已放弃" = `reset_retry_budget`（task_key

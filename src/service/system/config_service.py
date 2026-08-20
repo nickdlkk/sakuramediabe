@@ -35,13 +35,11 @@ READONLY_KEYS: frozenset[str] = frozenset({"auth", "enable_docs", "plugins"})
 SECTION_EFFECT: dict[str, ConfigEffectLevel] = {
     "database": ConfigEffectLevel.RESTART_API,          # 连接池启动建一次，不重连
     "media": ConfigEffectLevel.HOT,                      # 使用时现读
-    "movie_info_translation": ConfigEffectLevel.HOT,     # 每次构造 client 现读
     "metadata": ConfigEffectLevel.HOT,                   # provider 每次 build 现读
     "scheduler": ConfigEffectLevel.RESTART_SCHEDULER,    # cron 装配时烘进 CronTrigger
     "downloads": ConfigEffectLevel.RESTART_SCHEDULER,    # 阈值由 aps 定时清理任务消费
     "media_import": ConfigEffectLevel.HOT,               # 每次浏览/导入现读，api 驱动
     "logging": ConfigEffectLevel.RESTART_API,            # 仅 configure_logging() 启动期应用
-    "indexer_settings": ConfigEffectLevel.HOT,           # 每次 new client 现读
     "image_search": ConfigEffectLevel.HOT,               # 现读 + refresh 清 lru 单例
     "qdrant": ConfigEffectLevel.HOT,                     # 现读 + refresh 清 lru 单例
 }

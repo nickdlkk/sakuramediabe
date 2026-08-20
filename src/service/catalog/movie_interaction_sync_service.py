@@ -8,9 +8,9 @@ from src.common.runtime_time import utc_now_for_db
 from src.metadata._providers.exceptions import MetadataRequestError
 from src.metadata.factory import build_javdb_provider
 from src.metadata._providers.javdb import JavdbProvider
-from src.metadata._providers.models import JavdbMovieDetailResource
 from src.metadata.provider import MetadataNotFoundError
-from src.model import Movie, RankingItem, ResourceTaskState, get_database
+from src.model import Movie, ResourceTaskState, get_database
+from src.service.catalog.catalog_import_service import CatalogImportService
 from src.service.catalog.movie_heat_service import MovieHeatService
 from src.service.system.resource_task_runner import (
     STATE_EXHAUSTED,
@@ -34,18 +34,22 @@ class MovieInteractionSyncService:
     """
 
     TASK_KEY = "movie_interaction_sync"
+    # 互动数写入的字段集合（与 CatalogImportService.update_movie_fields 白名单一致）。
+    INTERACTION_FIELDS = (
+        "score",
+        "score_number",
+        "watched_count",
+        "want_watch_count",
+        "comment_count",
+    )
     INTERRUPTED_SYNC_ERROR_MESSAGE = "影片互动数同步任务中断，等待重试"
     # 分层策略：
     #   1. 从未同步过的影片：seed 一次，之后按下面分层决定是否再刷。
-    #   2. 活榜在榜（RankingItem 里有一条非"静态历史榜"记录）：1 天间隔。
-    #      配合 sync-movie-interactions 每天一次的调度，等于每次都刷。
-    #      静态历史榜（当前仅 javdb+top250+过去年份）从 ranked 集合里剔除，
-    #      榜单本身不会再变，跟着每天刷纯粹浪费。
-    #   3. 最近 60 天新片：2 天。
-    #   4. 60~180 天中间档：7 天。
-    #   5. 其它（含 180 天前 / 无 release_date / 只落在静态历史榜里）：不再周期刷。
-    #   6. 订阅补刷：subscribed_at > last_succeeded_at 触发一次性再同步。
-    RANKING_REFRESH_INTERVAL = timedelta(days=1)
+    #   2. 最近 60 天新片：2 天。
+    #   3. 60~180 天中间档：7 天。
+    #   4. 其它（含 180 天前 / 无 release_date）：不再周期刷。
+    #   5. 订阅补刷：subscribed_at > last_succeeded_at 触发一次性再同步。
+    # 排行榜影片不再因"在榜"被强制刷新，与普通影片走同一套分层。
     RECENT_REFRESH_INTERVAL = timedelta(days=2)
     MIDDLE_REFRESH_INTERVAL = timedelta(days=7)
     # 失败预算：JavDB 请求性失败按小时级退避，5 次/轮后 exhausted；
@@ -54,8 +58,14 @@ class MovieInteractionSyncService:
         max_attempts=5, backoff_base_seconds=3600, backoff_max_seconds=86400
     )
 
-    def __init__(self, provider: JavdbProvider | None = None):
+    def __init__(
+        self,
+        provider: JavdbProvider | None = None,
+        catalog_import_service: CatalogImportService | None = None,
+    ):
         self.provider = provider or build_javdb_provider()
+        # 字段写入统一走 CatalogImportService.update_movie_fields（不存在先完整导入，存在只更新指定字段）。
+        self.catalog_import_service = catalog_import_service or CatalogImportService()
 
     @staticmethod
     @classmethod
@@ -88,12 +98,7 @@ class MovieInteractionSyncService:
         movie: Movie,
         *,
         now: datetime,
-        ranked_movie_ids: set[int],
     ) -> timedelta | None:
-        # 活榜在榜每天刷；ranked_movie_ids 已在 _load_ranked_movie_ids 里剔除静态历史榜。
-        if movie.id in ranked_movie_ids:
-            return cls.RANKING_REFRESH_INTERVAL
-
         release_date = cls._normalize_release_date(movie.release_date)
         if release_date is None:
             # 无发布日期无法归档，不落任何周期分层。
@@ -104,7 +109,7 @@ class MovieInteractionSyncService:
             return cls.RECENT_REFRESH_INTERVAL
         if release_date >= now - timedelta(days=180):
             return cls.MIDDLE_REFRESH_INTERVAL
-        # 180 天以上且未在活榜的老片不再周期刷，只靠 seed / 订阅补刷 / 手动接口触发。
+        # 180 天以上的老片不再周期刷，只靠 seed / 订阅补刷 / 手动接口触发。
         return None
 
     @classmethod
@@ -129,36 +134,12 @@ class MovieInteractionSyncService:
         }
 
     @classmethod
-    def _load_ranked_movie_ids(cls, movie_ids: list[int]) -> set[int]:
-        if not movie_ids:
-            return set()
-        # 排除静态历史榜（当前仅 javdb + top250 + 过去年份 period）。这些榜单一旦抓过就永不
-        # 更新，影片留在 RankingItem 里只是归档，不应触发每日互动数刷新。年份集合复用
-        # ranking_service.top250_historical_year_periods()，与该模块历史年份判定同源。
-        from src.service.discovery.ranking_service import top250_historical_year_periods
-
-        historical_periods = top250_historical_year_periods()
-        query = RankingItem.select(RankingItem.movie).where(
-            RankingItem.movie.in_(movie_ids)
-        )
-        if historical_periods:
-            query = query.where(
-                ~(
-                    (RankingItem.source_key == "javdb")
-                    & (RankingItem.board_key == "top250")
-                    & (RankingItem.period.in_(historical_periods))
-                )
-            )
-        return {int(movie_id) for (movie_id,) in query.distinct().tuples()}
-
-    @classmethod
     def _is_due_for_sync(
         cls,
         movie: Movie,
         *,
         now: datetime,
         last_succeeded_at: datetime | None,
-        ranked_movie_ids: set[int],
     ) -> bool:
         # Seed 首次：任何影片首次都刷一次，之后按下面分层决定是否再刷。
         if last_succeeded_at is None:
@@ -176,7 +157,6 @@ class MovieInteractionSyncService:
         refresh_interval = cls._resolve_refresh_interval(
             movie,
             now=now,
-            ranked_movie_ids=ranked_movie_ids,
         )
         # 不在任何分层、也没有待补订阅：seed 后不再自动周期刷。
         if refresh_interval is None:
@@ -196,9 +176,8 @@ class MovieInteractionSyncService:
             query = query.where(Movie.id.in_(list(only_ids)))
         movies = list(query)
         movie_ids = [movie.id for movie in movies]
-        # 批量预加载状态与在榜集合，避免逐片查询放大数据库压力。
+        # 批量预加载状态，避免逐片查询放大数据库压力。
         snapshot_by_id = self._load_state_snapshot_by_movie_ids(movie_ids)
-        ranked_movie_ids = self._load_ranked_movie_ids(movie_ids)
         candidates: list[Movie] = []
         for movie in movies:
             state, last_succeeded_at, next_retry_at = snapshot_by_id.get(
@@ -219,20 +198,9 @@ class MovieInteractionSyncService:
                 movie,
                 now=now,
                 last_succeeded_at=last_succeeded_at,
-                ranked_movie_ids=ranked_movie_ids,
             ):
                 candidates.append(movie)
         return candidates
-
-    @classmethod
-    def _build_interaction_payload(cls, detail: JavdbMovieDetailResource) -> dict[str, int | float]:
-        return {
-            "score": detail.score or 0,
-            "score_number": detail.score_number,
-            "watched_count": detail.watched_count,
-            "want_watch_count": detail.want_watch_count,
-            "comment_count": detail.comment_count,
-        }
 
     def _fetch_and_apply(self, movie: Movie) -> tuple[bool, int]:
         """抓详情并落库互动数 + 联动热度；失败抛带 error_code 的 TaskItemError。"""
@@ -244,23 +212,17 @@ class MovieInteractionSyncService:
         except MetadataRequestError as exc:
             raise TaskItemError("javdb_request_error", str(exc)) from exc
 
-        interaction_payload = self._build_interaction_payload(detail)
-        updated_fields = []
-        interaction_changed = False
-        for field_name, target_value in interaction_payload.items():
-            if getattr(movie, field_name) == target_value:
-                continue
-            interaction_changed = True
-            setattr(movie, field_name, target_value)
-            updated_fields.append(Movie._meta.fields[field_name])
-
-        heat_updated_count = 0
+        # 变更检测已内置于 update_movie_fields（值一致的字段跳过）；无实际变更时不重算 heat。
+        # 互动数写入与 heat 重算包在同一事务，避免中间崩溃留下不一致窗口。
         with get_database().atomic():
+            updated_movie, _created, updated_fields = self.catalog_import_service.update_movie_fields(
+                detail,
+                self.INTERACTION_FIELDS,
+            )
+            heat_updated_count = 0
             if updated_fields:
-                movie.save(only=updated_fields)
-            if interaction_changed:
-                heat_updated_count = MovieHeatService.update_single_movie_heat(movie.id)
-        return interaction_changed, heat_updated_count
+                heat_updated_count = MovieHeatService.update_single_movie_heat(updated_movie.id)
+        return bool(updated_fields), heat_updated_count
 
     def _process_one(self, ctx, movie: Movie) -> None:
         latest_movie = Movie.get_by_id(movie.id)

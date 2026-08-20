@@ -13,25 +13,26 @@
 
 ```json
 {
-  "task_key": "ranking_sync",
+  "task_key": "movie_heat_update",
   "plugin_id": null,
-  "log_name": "ranking-sync",
-  "cli_name": "sync-rankings",
-  "cli_help": "执行一次排行榜同步",
-  "cron_setting": "ranking_sync_cron",
-  "cron_expr": "0 2 * * *",
+  "log_name": "movie-heat-update",
+  "cli_name": "update-movie-heat",
+  "cli_help": "执行一次影片热度重算",
+  "cron_setting": "movie_heat_cron",
+  "cron_expr": "15 0 * * *",
   "manual_trigger_allowed": true,
+  "params_schema": null,
   "last_task_run": {
     "id": 12,
-    "task_key": "ranking_sync",
-    "task_name": "排行榜同步",
+    "task_key": "movie_heat_update",
+    "task_name": "影片热度更新",
     "trigger_type": "scheduled",
     "state": "completed",
     "progress_current": null,
     "progress_total": null,
     "progress_text": null,
     "result_text": null,
-    "result_summary": {"stored_items": 230},
+    "result_summary": {"candidate_count": 120, "updated_count": 96, "formula_version": "v3"},
     "error_message": null,
     "started_at": "2026-05-13T02:00:00",
     "finished_at": "2026-05-13T02:03:12",
@@ -50,8 +51,11 @@
 - `cli_help`：CLI 帮助文案，也可作为前端说明文案
 - `cron_setting`：内建任务为 `Scheduler` 字段名；插件任务为
   `plugins.job_crons.<plugin_id>.<task_key>` 配置路径
-- `cron_expr`：当前运行配置解析出的 cron 表达式；缺失新增配置时回退默认值
+- `cron_expr`：当前运行配置解析出的 cron 表达式；缺失新增配置时回退默认值；
+  `manual_only` 任务（无定时、只能手动带参触发）为 `null`
 - `manual_trigger_allowed`：是否允许通过 HTTP 手动触发
+- `params_schema`：任务声明了参数模型时返回其 JSON Schema，前端可据此渲染请求体；
+  无参数任务为 `null`
 - `last_task_run`：该任务最新一条运行记录；从未运行过时为 `null`
 
 ### ManualJobTriggerResponse
@@ -59,7 +63,7 @@
 ```json
 {
   "task_run_id": 13,
-  "task_key": "ranking_sync",
+  "task_key": "movie_heat_update",
   "state": "pending"
 }
 ```
@@ -91,7 +95,7 @@
 行为说明：
 
 - 只返回 `src.scheduler.registry.JOB_REGISTRY` 中注册的任务
-- 只有在 `config.toml` 的 `plugins.enabled` 中显式启用且成功加载的插件任务才会进入注册表
+- 只有在 `config.toml` 的 `plugins.enabled` 中显式启用且成功加载的插件任务才会进入注册表（插件开发见 [插件系统开发指南](./plugins.md)）
 - `last_task_run` 使用每个 `task_key` 最新一条 `BackgroundTaskRun` 记录
 - 任务元数据来自后端注册表，不允许通过接口修改
 
@@ -107,10 +111,17 @@
 
 - `200 OK`：返回新建的任务运行记录 ID 与初始状态
 
+请求体：
+
+- 无参数任务：不传请求体；
+- 声明了 `params_schema` 的任务：传符合该 JSON Schema 的 JSON 对象，
+  例如字幕抓取任务 `{"movie_number": "ABP-123"}`。
+
 错误响应：
 
 - `401 Unauthorized`：未认证
 - `403 manual_trigger_forbidden`：该任务不允许通过 HTTP 手动触发
+- `422 invalid_job_params`：请求体不符合任务声明的 `params_schema`
 - `404 job_not_found`：`task_key` 不在任务注册表中
 - `409 task_conflict`：同一任务已有 `manual` 或 `scheduled` 运行记录占用互斥锁
 
@@ -120,7 +131,7 @@
 {
   "error": {
     "code": "task_conflict",
-    "message": "任务“排行榜同步”已在运行中",
+    "message": "任务“影片热度更新”已在运行中",
     "details": {
       "blocking_task_run_id": 12,
       "blocking_trigger_type": "scheduled",

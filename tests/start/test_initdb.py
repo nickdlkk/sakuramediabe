@@ -29,6 +29,7 @@ from src.model import (
     ResourceTaskState,
     SchemaMigration,
     Subtitle,
+    SubtitleImportJob,
     SystemEvent,
     SystemNotification,
     User,
@@ -105,6 +106,7 @@ def test_create_tables_creates_system_tables(clean_db, monkeypatch):
     assert SystemNotification.table_exists()
     assert SystemEvent.table_exists()
     assert Subtitle.table_exists()
+    assert SubtitleImportJob.table_exists()
     assert MediaRapidUploadBatch.table_exists()
     assert MediaRapidUploadItem.table_exists()
     # 秒传 item 需带 failure_reason 列，用来区分 not_hit / 其它可重试失败。
@@ -247,19 +249,36 @@ def test_create_tables_creates_current_schema_columns(clean_db, monkeypatch):
     assert "subscribed_at" in actor_columns
     assert BackgroundTaskRun.table_exists()
     assert ResourceTaskState.table_exists()
+    # v2-lite 字段主权两列：新库按模型渲染出 JSONB / BIGINT + 服务端默认值
+    # （与迁移 20260816_01 的 ALTER 同构，裸 INSERT 也有兜底）。
+    movie_columns = _column_names(database, "movie")
+    assert "field_owners" in movie_columns
+    assert "mutation_revision" in movie_columns
+    movie_column_types = {
+        column.name: column.data_type
+        for column in database.get_columns("movie")
+    }
+    assert movie_column_types["field_owners"] == "jsonb"
+    assert movie_column_types["mutation_revision"] == "bigint"
+    movie_column_defaults = {
+        column.name: column.default
+        for column in database.get_columns("movie")
+    }
+    assert movie_column_defaults["field_owners"] == "'{}'::jsonb"
+    assert movie_column_defaults["mutation_revision"] == "0"
 
 
 def test_create_tables_creates_resource_task_state_unique_constraint(clean_db, monkeypatch):
     create_tables()
 
     ResourceTaskState.create(
-        task_key="movie_desc_sync",
+        task_key="movie_interaction_sync",
         resource_type="movie",
         resource_id=1,
     )
     try:
         ResourceTaskState.create(
-            task_key="movie_desc_sync",
+            task_key="movie_interaction_sync",
             resource_type="movie",
             resource_id=1,
         )
@@ -273,18 +292,18 @@ def test_create_tables_creates_background_task_run_mutex_index_for_new_schema(cl
     create_tables()
 
     BackgroundTaskRun.create(
-        task_key="ranking_sync",
-        task_name="排行榜同步",
+        task_key="movie_heat_update",
+        task_name="影片热度更新",
         trigger_type="scheduled",
-        mutex_key="aps:ranking_sync",
+        mutex_key="aps:movie_heat_update",
     )
 
     try:
         BackgroundTaskRun.create(
-            task_key="ranking_sync",
-            task_name="排行榜同步",
+            task_key="movie_heat_update",
+            task_name="影片热度更新",
             trigger_type="manual",
-            mutex_key="aps:ranking_sync",
+            mutex_key="aps:movie_heat_update",
         )
     except IntegrityError:
         pass
@@ -321,7 +340,7 @@ def test_create_tables_creates_task_queue_and_attempt_schema(clean_db, monkeypat
     # last_task_run_id 外键化：悬空引用必须被数据库拒绝。
     with pytest.raises(IntegrityError):
         ResourceTaskState.create(
-            task_key="movie_desc_sync",
+            task_key="movie_interaction_sync",
             resource_type="movie",
             resource_id=42,
             last_task_run_id=999_999,
@@ -449,6 +468,10 @@ def test_create_tables_creates_download_domain_multi_bind_schema(clean_db, monke
     # qB 停滞/慢速清理按 download_started_at 计时（排队时间不计），新库直接建出该列。
     assert "download_started_at" in task_columns
     assert _column_is_nullable(database, "download_task", "download_started_at") is True
+    # 每个索引器独立可选的 Torznab 鉴权 key，新库直接建出可空列。
+    indexer_columns = {column.name for column in database.get_columns("indexer")}
+    assert "api_key" in indexer_columns
+    assert _column_is_nullable(database, "indexer", "api_key") is True
     cloud115_indexes = {
         index.name: index
         for index in database.get_indexes("download_client")

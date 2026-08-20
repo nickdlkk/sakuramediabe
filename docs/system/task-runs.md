@@ -23,7 +23,7 @@
 ## 任务模型
 
 - `task_key`
-  - 任务类型稳定标识，如 `ranking_sync`、`download_task_import`
+  - 任务类型稳定标识，如 `movie_heat_update`、`download_task_import`
 - `task_name`
   - 前端直接展示的任务名称
 - `trigger_type`
@@ -48,7 +48,7 @@
 资源级任务状态统一存放在 `resource_task_state`，用于“任务记录页”直接按任务查看每条资源的执行状态。
 
 - `task_key`
-  - 稳定任务标识，如 `movie_desc_sync`、`media_thumbnail_generation`
+  - 稳定任务标识，如 `movie_interaction_sync`、`media_thumbnail_generation`
 - `resource_type`
   - 当前支持 `movie`、`media`
 - `resource_id`
@@ -59,6 +59,11 @@
   - `succeeded`
   - `failed`
 - `attempt_count`
+  - 本轮失败次数；延后不占用该预算
+- `deferred_count` / `deferred_limit`
+  - 已安排的延后次数及上限；状态复用 `extra` 保存，不新增表或数据库列
+- `deferred_reason` / `next_retry_at`
+  - 暂缓原因和下一次允许自动检查的时间
 - `last_attempted_at`
 - `last_succeeded_at`
 - `last_error`
@@ -96,7 +101,7 @@
 
 说明：
 
-- 主要用途：手动触发接口（影片翻译/互动同步、资源任务 action）返回 202 与 `task_run_id`
+- 主要用途：手动触发接口（互动同步、资源任务 action）返回 202 与 `task_run_id`
   后，前端在页面刷新、SSE 断连等丢失事件游标的场景下，仅凭 `task_run_id` 追溯终态与
   `error_message`
 - 记录不存在或已被活动清理任务删除时返回 404（`task_run_not_found`），前端按
@@ -120,10 +125,7 @@
 
 当前已注册：
 
-- `movie_desc_sync`
 - `movie_interaction_sync`
-- `movie_desc_translation`
-- `movie_title_translation`
 - `media_thumbnail_generation`
 
 ### `GET /system/resource-task-states`
@@ -164,10 +166,14 @@ GET /system/resource-task-states?task_key=media_thumbnail_generation&state=faile
 
 返回记录的 `resource_id` 即 `media_id`；`resource` 摘要同时包含影片番号、标题、媒体路径和有效状态。
 
+115 视频转码未完成时，缩略图任务会保持 `pending`，但返回 `deferred_count` 和
+`next_retry_at`。第 1 至第 5 次分别在 12、24、36、48、60 小时后检查；第 6 次仍未完成
+则为 `failed_terminal`。前端应展示“暂缓处理”，不能把 `attempt_count = 0` 写成“尝试 0 次”。
+
 ### `POST /system/resource-task-actions`
 
 资源级操作的唯一入口。旧的任务专用端点（缩略图 reset、订阅 search-resets、影片页单片
-翻译/互动同步）均已删除，全部并入本协议。
+互动同步）均已删除，全部并入本协议。
 
 请求体：
 
@@ -184,7 +190,7 @@ action 枚举：
 - `retry_now`：`failed_retryable` / `exhausted` → 立即重试（`exhausted` 隐式重开预算），
   入队一个带 `only_ids` 的可跟踪 run，响应携带 `task_run_id`
 - `rerun`：通用"立即强制执行"入口，`running` 之外任意状态可用；从未记账的资源就地播种
-  状态行；子集运行绕过"已完成"域条件（重译已翻译影片、强制补刷互动数都走它）
+  状态行；子集运行绕过"已完成"域条件（强制补刷互动数走它）
 - `reset_retry_budget`：`failed_retryable` / `failed_terminal` / `exhausted` → 回
   `pending` 重开预算（`retry_round + 1`、本轮计数归零），不建 run，等下一轮定时任务处理
 
@@ -198,7 +204,7 @@ action 枚举：
 - `resource_ids` 缺省时按 `state` 圈定整批目标，仅 `reset_retry_budget` 支持
   （例：`{"task_key": "subscribed_movie_auto_download", "action": "reset_retry_budget",
   "state": "exhausted"}` 即旧订阅页"重置全部已放弃"）；`state` 缺省为三个失败态全部
-- 领域合格性前置：影片已删除（`movie_not_found`）、缺原始简介（`movie_desc_missing`）、
+- 领域合格性前置：影片已删除（`movie_not_found`）、
   缺 JavDB ID（`movie_javdb_id_missing`）、未订阅（`movie_not_subscribed`）、媒体已删除
   （`media_not_found`）、媒体失效（`media_invalid`）等由任务注册的钩子逐条跳过
 - 协议级跳过原因：`task_state_not_found`（retry_now / reset 要求已有状态行；rerun 会播种）、
@@ -249,15 +255,7 @@ action 枚举：
 
 - APScheduler 注册的后台任务
 - 下载完成后的异步导入任务
-- 影片简介翻译任务（`movie_desc_translation`）
-- 影片标题翻译任务（`movie_title_translation`）
 - 批量媒体秒传任务（`media_rapid_upload`）：批次内顺序执行，结束后创建一条汇总通知
-
-## 影片描述回填终态失败
-
-- `movie_desc_sync` 在 DMM 明确返回“未找到对应番号”时，会把记录写成 `failed_terminal`
-  （`error_code` 结构化标注，Wave 2 起取代 `extra.terminal`）
-- 这类记录不会再被自动调度重复抓取；可经统一 action 的 `reset_retry_budget` / `rerun` 捞回
 
 ## APS 手动与定时互斥
 
@@ -282,6 +280,6 @@ action 枚举：
 - `trigger_type = manual` 的任务会在 `aps` 与 API 启动时扫描旧的 `pending` / `running` 记录，并统一回收为 `failed`
 - `trigger_type = internal` 的任务会在 `aps` 与 API 启动时扫描旧的 `pending` / `running` 记录，并统一回收为 `failed`
 - `trigger_type = startup` 的任务会在 API 启动时扫描旧的 `pending` / `running` 记录，并统一回收为 `failed`
-- 当回收到 `movie_desc_sync`、`movie_interaction_sync`、`movie_desc_translation`、`movie_title_translation` 或 `media_thumbnail_generation` 时，会联动把对应 `resource_task_state.state = running` 回收为 `failed`
+- 当回收到 `movie_interaction_sync` 或 `media_thumbnail_generation` 时，会联动把对应 `resource_task_state.state = running` 回收为 `failed`
 - 当回收到 `download_task_import` 任务时，会联动执行孤儿导入恢复；基于 `ImportJob` 与运行器活跃状态一起判定，只有确认导入线程已经失活，才会把 `ImportJob`、`DownloadTask.import_status` 与对应 activity 状态统一回收为失败链路
 - 当回收到 `media_rapid_upload` 时，会释放逐媒体活动锁；尚未切换云端定位的条目标记为 `failed`，已经切换云端但未完成本地清理的条目标记为 `cleanup_failed`，供重试接口继续收敛

@@ -121,8 +121,17 @@ class MovieService:
         director_name: str | None = None,
         maker_name: str | None = None,
         number_source: MovieNumberSource = MovieNumberSource.ALL,
+        heat_min: int | None = None,
+        heat_max: int | None = None,
     ):
         """构建影片列表的基础筛选链路，供列表和计数查询复用。"""
+        if heat_min is not None and heat_max is not None and heat_min > heat_max:
+            raise ApiError(
+                422,
+                "invalid_movie_filter",
+                "heat_min 不能大于 heat_max",
+                {"heat_min": heat_min, "heat_max": heat_max},
+            )
         query = Movie.select()
         if actor_id is None:
             filtered_query = query
@@ -155,6 +164,8 @@ class MovieService:
 
         if status == MovieListStatus.SUBSCRIBED:
             filtered_query = filtered_query.where(Movie.is_subscribed == True)
+        elif status == MovieListStatus.UNSUBSCRIBED:
+            filtered_query = filtered_query.where(Movie.is_subscribed == False)
         elif status == MovieListStatus.PLAYABLE:
             filtered_query = filtered_query.where(cls._playable_exists_expression())
 
@@ -176,6 +187,10 @@ class MovieService:
             filtered_query = filtered_query.where(Movie.movie_number.startswith("FC2"))
         elif number_source == MovieNumberSource.REGULAR:
             filtered_query = filtered_query.where(~(Movie.movie_number.startswith("FC2")))
+        if heat_min is not None:
+            filtered_query = filtered_query.where(Movie.heat >= heat_min)
+        if heat_max is not None:
+            filtered_query = filtered_query.where(Movie.heat <= heat_max)
         return filtered_query
 
     @staticmethod
@@ -221,23 +236,27 @@ class MovieService:
         director_name: str | None = None,
         maker_name: str | None = None,
         number_source: MovieNumberSource = MovieNumberSource.ALL,
+        heat_min: int | None = None,
+        heat_max: int | None = None,
     ):
         """列表查询统一在这里补齐封面图和 ``can_play`` 计算列。"""
         can_play_expression = cls._playable_exists_expression().alias("can_play")
         is_4k_expression = cls._special_tag_exists_expression("4K").alias("is_4k")
         query, _thin_cover_alias = with_movie_card_relations(
             cls._filtered_movies(
-                actor_id,
-                tag_ids,
-                tag_match,
-                year,
-                status,
-                collection_type,
-                special_tag,
-                series_id,
-                director_name,
-                maker_name,
-                number_source,
+                actor_id=actor_id,
+                tag_ids=tag_ids,
+                tag_match=tag_match,
+                year=year,
+                status=status,
+                collection_type=collection_type,
+                special_tag=special_tag,
+                series_id=series_id,
+                director_name=director_name,
+                maker_name=maker_name,
+                number_source=number_source,
+                heat_min=heat_min,
+                heat_max=heat_max,
             ).select(Movie, can_play_expression, is_4k_expression)
         )
         return query.order_by(*cls._build_movie_list_sort(sort, status))
@@ -442,37 +461,41 @@ class MovieService:
         sort: str | None = None,
         director_name: str | None = None,
         maker_name: str | None = None,
+        heat_min: int | None = None,
+        heat_max: int | None = None,
         page: int = 1,
         page_size: int = 20,
     ) -> PageResponse[MovieListItemResource]:
         start = max(page - 1, 0) * page_size
         total = MovieService._filtered_movies(
-            actor_id,
-            tag_ids,
-            tag_match,
-            year,
-            status,
-            collection_type,
-            special_tag,
-            None,
-            director_name,
-            maker_name,
-            number_source,
+            actor_id=actor_id,
+            tag_ids=tag_ids,
+            tag_match=tag_match,
+            year=year,
+            status=status,
+            collection_type=collection_type,
+            special_tag=special_tag,
+            director_name=director_name,
+            maker_name=maker_name,
+            number_source=number_source,
+            heat_min=heat_min,
+            heat_max=heat_max,
         ).count()
         movies = list(
             MovieService.movie_list_query(
-                actor_id,
-                tag_ids,
-                tag_match,
-                year,
-                status,
-                collection_type,
-                special_tag,
-                sort,
-                None,
-                director_name,
-                maker_name,
-                number_source,
+                actor_id=actor_id,
+                tag_ids=tag_ids,
+                tag_match=tag_match,
+                year=year,
+                status=status,
+                collection_type=collection_type,
+                special_tag=special_tag,
+                sort=sort,
+                director_name=director_name,
+                maker_name=maker_name,
+                number_source=number_source,
+                heat_min=heat_min,
+                heat_max=heat_max,
             ).offset(start).limit(page_size)
         )
         return PageResponse[MovieListItemResource](
@@ -684,7 +707,8 @@ class MovieService:
                 movie.subscribed_at = utc_now_for_db()
         else:
             movie.subscribed_at = None
-        movie.save()
+        # 窄更新：受保护字段白名单开放后裸 save() 会被护栏拒绝，订阅状态与标题无关。
+        movie.save(only=[Movie.is_subscribed, Movie.subscribed_at])
         if subscribed and not was_subscribed:
             cls._reset_search_state_for_new_subscriptions([movie.id])
 
@@ -706,7 +730,7 @@ class MovieService:
 
         movie.is_subscribed = False
         movie.subscribed_at = None
-        movie.save()
+        movie.save(only=[Movie.is_subscribed, Movie.subscribed_at])
 
     @staticmethod
     def _dedup_movie_number_keys(
@@ -762,7 +786,7 @@ class MovieService:
             movie.is_subscribed = True
             if not was_subscribed or movie.subscribed_at is None:
                 movie.subscribed_at = utc_now_for_db()
-            movie.save()
+            movie.save(only=[Movie.is_subscribed, Movie.subscribed_at])
             if not was_subscribed:
                 newly_subscribed_ids.append(movie.id)
         cls._reset_search_state_for_new_subscriptions(newly_subscribed_ids)
@@ -826,7 +850,7 @@ class MovieService:
                 continue
             movie.is_subscribed = False
             movie.subscribed_at = None
-            movie.save()
+            movie.save(only=[Movie.is_subscribed, Movie.subscribed_at])
             updated_count += 1
 
         return MovieSubscriptionBatchResponse(

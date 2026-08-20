@@ -2,7 +2,6 @@ import json
 import math
 import os
 import pathlib
-import re
 import secrets
 from enum import Enum
 from pathlib import Path
@@ -13,7 +12,6 @@ import toml
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 from pydantic import (
-    AliasChoices,
     BaseModel,
     Field,
     ValidationInfo,
@@ -26,6 +24,8 @@ from pydantic_settings import (
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+from src.plugins.manifest import PLUGIN_ID_PATTERN
 
 
 # 这里处理的是番号**前缀**（如 OFJE），不是完整番号，所以只做去空白 + 大写：
@@ -59,29 +59,8 @@ def _check_http_url(value: str, label: str, info: ValidationInfo | None) -> str:
     return value
 
 
-def _check_proxy_url(value: str | None, info: ValidationInfo | None) -> str | None:
-    # 代理允许 http/https 与 socks5(h)；None 或空串视为未配置，直接放行。
-    if value is None:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        return value
-    parsed = urlparse(normalized)
-    if parsed.scheme in {"http", "https", "socks5", "socks5h"} and parsed.netloc:
-        return value
-    message = "proxy 必须是 http/https/socks5/socks5h URL"
-    if _validation_is_strict(info):
-        raise ValueError(message)
-    logger.warning("配置 proxy 不是合法的 http/https/socks5(h) URL（当前值={!r}），将原样保留使用", value)
-    return value
-
-
 class DatabaseEngine(str, Enum):
     POSTGRES = "postgres"
-
-
-class IndexerType(str, Enum):
-    JACKETT = "jackett"
 
 
 class IndexerKind(str, Enum):
@@ -188,62 +167,31 @@ class Media(BaseModel):
         return normalized
 
 
-class MovieInfoTranslation(BaseModel):
-    enabled: bool = False
-    base_url: str = "http://localhost:8000"
-    api_key: str = ""
-    model: str = "gpt-4o-mini"
-    timeout_seconds: float = 300.0
-    connect_timeout_seconds: float = 3.0
-
-    @field_validator("base_url")
-    @classmethod
-    def _check_base_url(cls, value: str, info: ValidationInfo) -> str:
-        return _check_http_url(value, "base_url", info)
-
-
 class Metadata(BaseModel):
+    # 不再提供显式代理配置：所有外部站点请求统一跟随容器环境变量
+    # HTTP_PROXY / HTTPS_PROXY / NO_PROXY 分流（httpx trust_env 默认开启）。
     javdb_host: str = "jdforrepam.com"
-    # JavDB 账号，用于抓取需登录的榜单（年度 / 全部 / 片源类型 TOP250）；留空则不抓这些榜单。
-    javdb_username: str | None = None
-    javdb_password: str | None = None
-    proxy: str | None = None
     gfriends_filetree_url: str = "https://cdn.jsdelivr.net/gh/xinxin8816/gfriends/Filetree.json"
     gfriends_cdn_base_url: str = "https://cdn.jsdelivr.net/gh/xinxin8816/gfriends"
     gfriends_filetree_cache_path: str = "/data/cache/gfriends/gfriends-filetree.json"
     gfriends_filetree_cache_ttl_hours: int = 24 * 7
     import_metadata_max_workers: int = 3
 
-    @field_validator("proxy")
-    @classmethod
-    def _check_proxy(cls, value: str | None, info: ValidationInfo) -> str | None:
-        return _check_proxy_url(value, info)
-
     @field_validator("gfriends_filetree_url", "gfriends_cdn_base_url")
     @classmethod
     def _check_gfriends_urls(cls, value: str, info: ValidationInfo) -> str:
         return _check_http_url(value, "gfriends URL", info)
 
-    @property
-    def javdb_account_configured(self) -> bool:
-        # 账号与密码都非空白才视为已配置，决定是否抓取需登录的 TOP250 榜单。
-        return bool(
-            (self.javdb_username or "").strip()
-            and (self.javdb_password or "").strip()
-        )
-
-    @property
-    def normalized_proxy(self) -> str | None:
-        # 统一在配置层做代理值归一化（去空白，空串归一为 None）。
-        return (self.proxy or "").strip() or None
 
 
-_PLUGIN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+_PLUGIN_ID_PATTERN = PLUGIN_ID_PATTERN
 
 
 class Plugins(BaseModel):
     """仓库内可信插件配置；插件必须出现在 enabled 中才会被导入。"""
 
+    # 插件根目录：生产默认 /data/plugins；本地开发可指向 ./storage/plugins。
+    root_dir: str = "/data/plugins"
     enabled: list[str] = Field(default_factory=list)
     job_crons: dict[str, dict[str, str]] = Field(default_factory=dict)
     settings: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -291,13 +239,9 @@ class Scheduler(BaseModel):
     movie_collection_sync_cron: str = "0 1 * * *"
     movie_heat_cron: str = "15 0 * * *"
     movie_interaction_sync_cron: str = "0 5 * * *"
-    ranking_sync_cron: str = "45 1 * * *"
     hot_review_sync_cron: str = "20 1 * * *"
     # 全量巡检会 stat 媒体库里每个文件，放到每天凌晨集中一次，避免高频唤醒媒体盘。
     media_file_scan_cron: str = "0 4 * * *"
-    movie_desc_sync_cron: str = "0 4 * * *"
-    movie_desc_translation_cron: str = "15 4 * * *"
-    movie_title_translation_cron: str = "20 4 * * *"
     # 空跑只查 DB 不读盘，30 分钟一次足够；有新导入时缩略图会在同一活跃窗口内跟上。
     media_thumbnail_cron: str = "*/30 * * * *"
     image_search_index_cron: str = "0 0 * * *"
@@ -400,11 +344,6 @@ class Logging(BaseModel):
     level: str = "INFO"
 
 
-class IndexerSettings(BaseModel):
-    type: IndexerType = IndexerType.JACKETT
-    api_key: str = "change-me"
-
-
 class ImageSearch(BaseModel):
     inference_base_url: str = "http://joytag-infer:8001"
     # CPU 后端逐张推理，一批 16 张会串行跑满 16 次；30s 不足以覆盖，中途超时会让整批作废。
@@ -456,17 +395,12 @@ class Settings(BaseSettings):
     database: Database = Field(default_factory=Database)
     auth: Auth = Field(default_factory=Auth)
     media: Media = Field(default_factory=Media)
-    movie_info_translation: MovieInfoTranslation = Field(
-        default_factory=MovieInfoTranslation,
-        validation_alias=AliasChoices("movie_info_translation", "movie_desc_translation"),
-    )
     metadata: Metadata = Field(default_factory=Metadata)
     plugins: Plugins = Field(default_factory=Plugins)
     scheduler: Scheduler = Field(default_factory=Scheduler)
     downloads: Downloads = Field(default_factory=Downloads)
     media_import: MediaImport = Field(default_factory=MediaImport)
     logging: Logging = Field(default_factory=Logging)
-    indexer_settings: IndexerSettings = Field(default_factory=IndexerSettings)
     image_search: ImageSearch = Field(default_factory=ImageSearch)
     qdrant: Qdrant = Field(default_factory=Qdrant)
     enable_docs: bool = False
@@ -478,15 +412,12 @@ class Settings(BaseSettings):
 
     @model_validator(mode="before")
     @classmethod
-    def _upgrade_legacy_movie_translation_settings(cls, data: Any):
+    def _upgrade_legacy_settings(cls, data: Any):
         if not isinstance(data, dict):
             return data
         normalized_data = dict(data)
         # 兼容历史遗留的媒体音频识别配置节，读取时直接忽略，避免旧 config.toml 导致启动失败。
         normalized_data.pop("media_asr", None)
-        if "movie_info_translation" not in normalized_data and "movie_desc_translation" in normalized_data:
-            # 兼容旧配置节名称，统一映射到新的共享翻译配置上。
-            normalized_data["movie_info_translation"] = normalized_data["movie_desc_translation"]
         return normalized_data
 
     @classmethod

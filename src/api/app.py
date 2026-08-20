@@ -16,6 +16,7 @@ from src.api.exception.exception import (
 from src.api.routers.catalog.actors import router as actors_router
 from src.api.routers.catalog.movies import router as movies_router
 from src.api.routers.catalog.subscriptions import router as movie_subscriptions_router
+from src.api.routers.catalog.subtitle_imports import router as subtitle_imports_router
 from src.api.routers.catalog.tags import router as tags_router
 from src.api.routers.collections.clip_collections import (
     router as clip_collections_router,
@@ -46,9 +47,7 @@ from src.api.routers.system.auth import router as auth_router
 from src.api.routers.system.config import router as config_router
 from src.api.routers.system.indexer_settings import router as indexer_settings_router
 from src.api.routers.system.jobs import router as jobs_router
-from src.api.routers.system.movie_desc_translation_settings import (
-    router as movie_desc_translation_settings_router,
-)
+from src.api.routers.system.plugins import router as plugins_router
 from src.api.routers.system.status import router as status_router
 from src.api.routers.transfers.downloads import router as downloads_router
 from src.api.routers.transfers.media_import import router as media_import_router
@@ -105,6 +104,7 @@ def create_app() -> FastAPI:
     app.include_router(actors_router)
     app.include_router(movies_router)
     app.include_router(movie_subscriptions_router)
+    app.include_router(subtitle_imports_router)
     app.include_router(tags_router)
     app.include_router(playlists_router)
     app.include_router(clip_collections_router)
@@ -131,7 +131,7 @@ def create_app() -> FastAPI:
     app.include_router(accounts_router)
     app.include_router(auth_router)
     app.include_router(indexer_settings_router)
-    app.include_router(movie_desc_translation_settings_router)
+    app.include_router(plugins_router)
 
     app.include_router(config_router)
 

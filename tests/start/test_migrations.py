@@ -11,6 +11,7 @@ from src.model import (
     Image,
     MediaLibrary,
     SchemaMigration,
+    SubtitleImportJob,
     VideoImportJob,
 )
 from src.start.commands import main
@@ -262,7 +263,7 @@ def test_run_pending_migrations_extracts_movie_series_from_supported_legacy_sche
         "SELECT movie_number, series_id FROM movie ORDER BY movie_number"
     ).fetchall()
 
-    assert "title_zh" in movie_columns
+    assert "title_zh" not in movie_columns
     assert "series_id" in movie_columns
     assert "series_name" not in movie_columns
     assert "movie_series_name" not in movie_indexes
@@ -382,6 +383,25 @@ def test_run_pending_migrations_creates_video_import_job_on_existing_database(cl
     assert execution.applied is True
     assert clean_db.table_exists("video_import_job")
     assert "20260613_01_add_videos_and_decouple_media" in _schema_migration_names(clean_db)
+
+
+def test_run_pending_migrations_creates_subtitle_import_job_on_existing_database(clean_db):
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    # 模拟尚未应用当天迁移的库：依赖表都在，但还没有 subtitle_import_job，下次启动 migrate 应自动补建。
+    clean_db.drop_tables([SubtitleImportJob])
+    assert not clean_db.table_exists("subtitle_import_job")
+
+    summary = run_pending_migrations(clean_db)
+
+    execution = next(
+        item
+        for item in summary.executed
+        if item.name == "20260810_01_add_subtitle_import_job"
+    )
+    assert execution.applied is True
+    assert clean_db.table_exists("subtitle_import_job")
+    assert "20260810_01_add_subtitle_import_job" in _schema_migration_names(clean_db)
 
 
 def test_run_pending_migrations_adds_video_import_job_cloud_sources_idempotently(clean_db):
@@ -612,7 +632,7 @@ def test_run_pending_migrations_supports_empty_database_after_create_tables(clea
     actor_columns = {column.name for column in clean_db.get_columns("actor")}
 
     # 空库先按当前模型建表后，迁移执行结果至少要保持最终 schema 正确。
-    assert "title_zh" in movie_columns
+    assert "title_zh" not in movie_columns
     assert "series_id" in movie_columns
     assert "series_name" not in movie_columns
     assert clean_db.table_exists("movie_series")
@@ -1247,7 +1267,7 @@ def test_run_pending_migrations_moves_indexer_binding_to_junction_table(clean_db
     clean_db.execute_sql(
         """
         INSERT INTO indexer (created_at, updated_at, name, url, kind, download_client_id)
-        VALUES ('2026-07-14', '2026-07-14', 'mteam', 'http://jackett/api', 'pt', 1)
+        VALUES ('2026-07-14', '2026-07-14', 'mteam', 'http://torznab/api', 'pt', 1)
         """
     )
 
@@ -1272,6 +1292,18 @@ def test_run_pending_migrations_moves_indexer_binding_to_junction_table(clean_db
     assert "20260714_07_indexer_multi_client_binding" in _schema_migration_names(clean_db)
 
 
+def test_run_pending_migrations_adds_indexer_api_key_column(clean_db):
+    """20260812_01：indexer 补可空 api_key 列（每个索引器独立 Torznab 鉴权 key）。"""
+    _create_legacy_download_tables(clean_db)
+
+    run_pending_migrations(clean_db)
+
+    indexer_columns = {column.name: column for column in clean_db.get_columns("indexer")}
+    assert "api_key" in indexer_columns
+    assert indexer_columns["api_key"].null is True
+    assert "20260812_01_add_indexer_api_key" in _schema_migration_names(clean_db)
+
+
 def test_run_pending_migrations_adds_movie_number_upper_index(clean_db):
     """存量库补 UPPER(movie_number) 函数索引；新库由 create_tables 直接建出。
 
@@ -1294,6 +1326,37 @@ def test_run_pending_migrations_adds_movie_number_upper_index(clean_db):
         " AND schemaname = current_schema()"
     ).fetchone() is not None
     assert "20260728_01_add_movie_number_upper_index" in _schema_migration_names(clean_db)
+
+
+def test_run_pending_migrations_adds_movie_sort_indexes(clean_db):
+    """20260815_02：存量库补影片列表排序复合索引（NULLS LAST 同向）。"""
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    run_pending_migrations(clean_db)
+    clean_db.execute_sql(
+        "DELETE FROM schema_migration WHERE name = %s",
+        ("20260815_02_add_movie_sort_indexes",),
+    )
+    # 模拟存量库：先删掉 initdb 建出的同名索引，让迁移补齐。
+    clean_db.execute_sql("DROP INDEX IF EXISTS movie_release_date_sort")
+    clean_db.execute_sql("DROP INDEX IF EXISTS movie_subscribed_at_sort")
+
+    run_pending_migrations(clean_db)
+
+    indexed_definitions = {
+        row[0]: row[1]
+        for row in clean_db.execute_sql(
+            "SELECT indexname, indexdef FROM pg_indexes"
+            " WHERE schemaname = current_schema() AND indexname IN"
+            " ('movie_release_date_sort', 'movie_subscribed_at_sort')"
+        ).fetchall()
+    }
+    # 排序表达式必须与 build_ordered_expressions 的 NULLS LAST 输出同向，
+    # planner 才能用索引服务排序（反向扫描再服务 asc）。
+    assert "release_date DESC NULLS LAST" in indexed_definitions["movie_release_date_sort"]
+    assert "id DESC NULLS LAST" in indexed_definitions["movie_release_date_sort"]
+    assert "subscribed_at DESC NULLS LAST" in indexed_definitions["movie_subscribed_at_sort"]
+    assert "20260815_02_add_movie_sort_indexes" in _schema_migration_names(clean_db)
 
 
 def test_run_pending_migrations_drops_movie_similarity_table(clean_db):
@@ -1429,6 +1492,104 @@ def test_run_pending_migrations_wipes_task_run_history(clean_db):
     assert clean_db.execute_sql("SELECT count(*) FROM system_event").fetchone()[0] == 0
     assert clean_db.execute_sql("SELECT task_run_id FROM import_job").fetchone()[0] is None
     assert "20260729_02_wipe_task_run_history" in _schema_migration_names(clean_db)
+
+
+def test_run_pending_migrations_wipes_ranking_history(clean_db):
+    """排行榜插件化（20260813_01）：清空榜单条目与 ranking_sync 全链台账，其它任务不受影响。"""
+    from src.model import Movie, RankingItem, SystemEvent, SystemNotification
+
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    run_pending_migrations(clean_db)
+    clean_db.execute_sql(
+        "DELETE FROM schema_migration WHERE name = %s",
+        ("20260813_01_wipe_ranking_history",),
+    )
+
+    movie = Movie.create(movie_number="ABP-001", javdb_id="m-1", title="t")
+    RankingItem.create(
+        source_key="javdb",
+        board_key="top250",
+        period="2018",
+        rank=1,
+        movie_number="ABP-001",
+        movie=movie.id,
+    )
+    ranking_run = BackgroundTaskRun.create(
+        task_key="ranking_sync",
+        task_name="排行榜同步",
+        trigger_type="scheduled",
+        state="completed",
+    )
+    SystemNotification.create(
+        category="warning",
+        title="JavDB 账号登录失败",
+        content="登录失败",
+        related_task_run=ranking_run.id,
+    )
+    SystemNotification.create(
+        category="warning",
+        title="JavDB 账号登录失败",
+        content="失去关联的孤儿通知",
+    )
+    SystemEvent.create(
+        event_type="task_run_updated",
+        resource_type="task_run",
+        resource_id=ranking_run.id,
+        payload={"task_key": "ranking_sync"},
+    )
+    other_run = BackgroundTaskRun.create(
+        task_key="movie_heat_update",
+        task_name="影片热度更新",
+        trigger_type="scheduled",
+        state="completed",
+    )
+    SystemEvent.create(
+        event_type="task_run_updated",
+        resource_type="task_run",
+        resource_id=other_run.id,
+        payload={"task_key": "movie_heat_update"},
+    )
+
+    run_pending_migrations(clean_db)
+
+    assert clean_db.execute_sql("SELECT count(*) FROM ranking_item").fetchone()[0] == 0
+    assert (
+        clean_db.execute_sql(
+            "SELECT count(*) FROM background_task_run WHERE task_key = %s",
+            ("ranking_sync",),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        clean_db.execute_sql(
+            "SELECT count(*) FROM background_task_run WHERE task_key = %s",
+            ("movie_heat_update",),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        clean_db.execute_sql(
+            "SELECT count(*) FROM system_notification WHERE title = %s",
+            ("JavDB 账号登录失败",),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        clean_db.execute_sql(
+            "SELECT count(*) FROM system_event WHERE resource_id = %s",
+            (ranking_run.id,),
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        clean_db.execute_sql(
+            "SELECT count(*) FROM system_event WHERE resource_id = %s",
+            (other_run.id,),
+        ).fetchone()[0]
+        == 1
+    )
+    assert "20260813_01_wipe_ranking_history" in _schema_migration_names(clean_db)
 
 
 def test_run_pending_migrations_resets_interaction_sync_states_preserving_memory(clean_db):
@@ -1697,3 +1858,241 @@ def test_run_pending_migrations_adds_download_task_started_at(clean_db):
 
     # 幂等：再跑一次不重复建列。
     run_pending_migrations(clean_db)
+
+
+def test_run_pending_migrations_cleans_removed_movie_task_records(clean_db):
+    """20260815_01：删除已下线任务（movie_desc_sync / 两个翻译任务）的
+    状态行、尝试历史、运行记录与关联通知，其余 task_key 不受影响。"""
+    clean_db.bind(TEST_MODELS, bind_refs=False, bind_backrefs=False)
+    clean_db.create_tables(TEST_MODELS)
+    run_pending_migrations(clean_db)
+    clean_db.execute_sql(
+        "DELETE FROM schema_migration WHERE name = %s",
+        ("20260815_01_cleanup_removed_movie_task_records",),
+    )
+    # 播种：三个已下线 task_key + 一个保留 task_key 的 state / attempt / run / notification。
+    # 注意：run id 依赖空表 INSERT 顺序（1-4），下方通知/事件用硬编码 id 引用它们。
+    clean_db.execute_sql(
+        "INSERT INTO resource_task_state"
+        " (created_at, updated_at, task_key, resource_type, resource_id, state,"
+        "  attempt_count, retry_round)"
+        " VALUES"
+        " (now(), now(), 'movie_desc_sync', 'movie', 1, 'pending', 0, 0),"
+        " (now(), now(), 'movie_desc_translation', 'movie', 2, 'failed', 3, 0),"
+        " (now(), now(), 'movie_title_translation', 'movie', 3, 'succeeded', 1, 0),"
+        " (now(), now(), 'movie_interaction_sync', 'movie', 4, 'succeeded', 1, 0)"
+    )
+    clean_db.execute_sql(
+        "INSERT INTO resource_task_attempt"
+        " (created_at, updated_at, task_key, resource_type, resource_id, attempt_no,"
+        "  state, retryable)"
+        " VALUES"
+        " (now(), now(), 'movie_desc_sync', 'movie', 1, 1, 'failed', false),"
+        " (now(), now(), 'movie_desc_translation', 'movie', 2, 1, 'failed', true),"
+        " (now(), now(), 'movie_title_translation', 'movie', 3, 1, 'succeeded', null),"
+        " (now(), now(), 'movie_interaction_sync', 'movie', 4, 1, 'succeeded', null)"
+    )
+    clean_db.execute_sql(
+        "INSERT INTO background_task_run"
+        " (created_at, updated_at, task_key, task_name, trigger_type, state, result_summary)"
+        " VALUES"
+        " (now(), now(), 'movie_desc_sync', '影片描述回填', 'scheduled', 'completed', '{}'),"
+        " (now(), now(), 'movie_desc_translation', '影片简介翻译', 'scheduled', 'completed', '{}'),"
+        " (now(), now(), 'movie_title_translation', '影片标题翻译', 'scheduled', 'completed', '{}'),"
+        " (now(), now(), 'movie_interaction_sync', '影片互动数同步', 'scheduled', 'completed', '{}')"
+    )
+    # 通知：一条指向已删任务 run（应删除），一条指向保留任务 run（应保留）。
+    clean_db.execute_sql(
+        "INSERT INTO system_notification (created_at, updated_at, category, title, content,"
+        " is_read, related_task_run_id)"
+        " VALUES"
+        " (now(), now(), 'task_result', '简介翻译完成', 'body', false, 2),"
+        " (now(), now(), 'task_result', '互动同步完成', 'body', false, 4)"
+    )
+    # 事件：两条指向已删任务 run 的 task_run 事件（应删除）、一条指向保留任务 run（应保留）、
+    # 一条非 task_run 事件（resource_type 过滤，应保留）。
+    clean_db.execute_sql(
+        "INSERT INTO system_event (created_at, updated_at, event_type, resource_type,"
+        " resource_id, payload, emitted_at)"
+        " VALUES"
+        " (now(), now(), 'task_run_started', 'task_run', 1, '{}', now()),"
+        " (now(), now(), 'task_run_finished', 'task_run', 3, '{}', now()),"
+        " (now(), now(), 'task_run_finished', 'task_run', 4, '{}', now()),"
+        " (now(), now(), 'movie_created', 'movie', 42, '{}', now())"
+    )
+
+    run_pending_migrations(clean_db)
+
+    # 已删 task_key 的行全部清掉；保留的 movie_interaction_sync 不受影响。
+    assert clean_db.execute_sql(
+        "SELECT task_key FROM resource_task_state ORDER BY task_key"
+    ).fetchall() == [("movie_interaction_sync",)]
+    assert clean_db.execute_sql(
+        "SELECT task_key FROM resource_task_attempt ORDER BY task_key"
+    ).fetchall() == [("movie_interaction_sync",)]
+    assert clean_db.execute_sql(
+        "SELECT task_key FROM background_task_run ORDER BY task_key"
+    ).fetchall() == [("movie_interaction_sync",)]
+    # 指向已删任务的通知删除；指向保留任务的通知保留。
+    assert clean_db.execute_sql(
+        "SELECT related_task_run_id FROM system_notification"
+    ).fetchall() == [(4,)]
+    # 指向已删 run 的 task_run 事件删除；指向保留 run 的事件与非 task_run 事件保留。
+    assert clean_db.execute_sql(
+        "SELECT resource_type, resource_id FROM system_event ORDER BY resource_type, resource_id"
+    ).fetchall() == [("movie", 42), ("task_run", 4)]
+    assert "20260815_01_cleanup_removed_movie_task_records" in _schema_migration_names(clean_db)
+
+
+def _create_movie_table_with_desc_fields(clean_db):
+    """20260815_03 迁移前的 movie 表：含 desc / desc_zh / title_zh 三列，summary 已存在。"""
+    clean_db.execute_sql(
+        """
+        CREATE TABLE movie (
+            id SERIAL PRIMARY KEY,
+            created_at TIMESTAMP NOT NULL,
+            updated_at TIMESTAMP NOT NULL,
+            javdb_id VARCHAR(64) NOT NULL UNIQUE,
+            movie_number VARCHAR(255) NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            release_date TIMESTAMP NULL,
+            duration_minutes INTEGER NOT NULL DEFAULT 0,
+            score DOUBLE PRECISION NOT NULL DEFAULT 0,
+            score_number INTEGER NOT NULL DEFAULT 0,
+            watched_count INTEGER NOT NULL DEFAULT 0,
+            cover_image_id INTEGER NULL,
+            thin_cover_image_id INTEGER NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            series_id INTEGER NULL,
+            maker_name VARCHAR(255) NULL,
+            director_name VARCHAR(255) NULL,
+            want_watch_count INTEGER NOT NULL DEFAULT 0,
+            comment_count INTEGER NOT NULL DEFAULT 0,
+            heat INTEGER NOT NULL DEFAULT 0,
+            is_collection BOOLEAN NOT NULL DEFAULT FALSE,
+            is_collection_overridden BOOLEAN NOT NULL DEFAULT FALSE,
+            is_subscribed BOOLEAN NOT NULL DEFAULT FALSE,
+            subscribed_at TIMESTAMP NULL,
+            "desc" TEXT NOT NULL DEFAULT '',
+            desc_zh TEXT NOT NULL DEFAULT '',
+            title_zh TEXT NOT NULL DEFAULT '',
+            extra TEXT NULL
+        )
+        """
+    )
+
+
+def test_run_pending_migrations_merges_movie_title_and_desc_fields(clean_db):
+    """20260815_03：desc / desc_zh / title_zh 存量数据收拢到 title / summary 后删列。
+
+    覆盖六类样本：仅 title_zh（标题被中文覆盖）、desc_zh 与 desc 同时有值（zh 优先）、
+    仅 desc 有值（回填 summary）、两者皆空（summary 保持原样）、NULL desc_zh（回落 desc）、
+    纯空白串（不算有值，不得覆盖）；同时验证三列被删除与幂等重跑。
+    """
+    _create_movie_table_with_desc_fields(clean_db)
+    # 更老的库形态可能允许 desc_zh 为 NULL：放开约束以覆盖 COALESCE 回落分支。
+    clean_db.execute_sql('ALTER TABLE "movie" ALTER COLUMN "desc_zh" DROP NOT NULL')
+    clean_db.execute_sql(
+        """
+        INSERT INTO movie (
+            created_at, updated_at, javdb_id, movie_number, title, summary,
+            "desc", desc_zh, title_zh
+        ) VALUES
+            ('2026-08-15', '2026-08-15', 'j-1', 'ABP-001', '日文标题', 'javdb简介', '日文简介', '中文简介', '中文标题'),
+            ('2026-08-15', '2026-08-15', 'j-2', 'ABP-002', '日文标题', '已有简介', '日文简介', '', ''),
+            ('2026-08-15', '2026-08-15', 'j-3', 'ABP-003', '日文标题', '已有简介', '', '', ''),
+            ('2026-08-15', '2026-08-15', 'j-4', 'ABP-004', '日文标题', '保持不动', '', '', ''),
+            ('2026-08-15', '2026-08-15', 'j-5', 'ABP-005', '日文标题', '已有简介', '日文简介', NULL, ''),
+            ('2026-08-15', '2026-08-15', 'j-6', 'ABP-006', '日文标题', '已有简介', '   ', '   ', '   '),
+            ('2026-08-15', '2026-08-15', 'j-7', 'ABP-007', '日文标题', '已有简介', '   ', '中文简介', '')
+        """
+    )
+
+    run_pending_migrations(clean_db)
+
+    columns = {column.name for column in clean_db.get_columns("movie")}
+    assert "desc" not in columns
+    assert "desc_zh" not in columns
+    assert "title_zh" not in columns
+    assert "summary" in columns
+    assert "title" in columns
+    rows = clean_db.execute_sql(
+        "SELECT movie_number, title, summary FROM movie ORDER BY movie_number"
+    ).fetchall()
+    # 仅 title_zh 有值：标题被中文覆盖，summary 取 desc_zh（zh 优先）。
+    assert rows[0] == ("ABP-001", "中文标题", "中文简介")
+    # desc_zh 为空但 desc 有值：summary 回填 desc。
+    assert rows[1] == ("ABP-002", "日文标题", "日文简介")
+    # 两者皆空：summary 保持原样。
+    assert rows[2] == ("ABP-003", "日文标题", "已有简介")
+    assert rows[3] == ("ABP-004", "日文标题", "保持不动")
+    # NULL desc_zh：COALESCE 回落，summary 仍取 desc。
+    assert rows[4] == ("ABP-005", "日文标题", "日文简介")
+    # title_zh 与 desc_zh 都是纯空白：不算有值，title 与 summary 都不被覆盖。
+    assert rows[5] == ("ABP-006", "日文标题", "已有简介")
+    # desc 是纯空白但 desc_zh 有值：summary 取 desc_zh。
+    assert rows[6] == ("ABP-007", "日文标题", "中文简介")
+    assert "20260815_03_merge_movie_title_desc_fields" in _schema_migration_names(clean_db)
+
+    # 幂等：重跑不改变已迁移数据（列已删，迁移只能走 SchemaMigration 跳过）。
+    second_summary = run_pending_migrations(clean_db)
+    assert second_summary.applied_count == 0
+    rows_after_rerun = clean_db.execute_sql(
+        "SELECT movie_number, title, summary FROM movie ORDER BY movie_number"
+    ).fetchall()
+    assert rows_after_rerun == rows
+
+
+def test_run_pending_migrations_merges_desc_without_desc_zh_column(clean_db):
+    """20260815_03：desc_zh 列缺失（极端老库）时，desc 直接回填 summary 的 else 分支。"""
+    _create_movie_table_missing_title_zh(clean_db)
+    # 模拟连 desc_zh 都没有的更老 schema：仅保留 desc。
+    clean_db.execute_sql('ALTER TABLE "movie" DROP COLUMN "desc_zh"')
+    clean_db.execute_sql(
+        """
+        INSERT INTO movie (
+            created_at, updated_at, javdb_id, movie_number, title, summary, "desc"
+        ) VALUES (
+            '2026-08-15', '2026-08-15', 'j-1', 'ABP-001', '日文标题', '已有简介', '日文简介'
+        )
+        """
+    )
+
+    run_pending_migrations(clean_db)
+
+    columns = {column.name for column in clean_db.get_columns("movie")}
+    assert "desc" not in columns
+    assert "desc_zh" not in columns
+    assert "title_zh" not in columns
+    rows = clean_db.execute_sql(
+        "SELECT movie_number, title, summary FROM movie ORDER BY movie_number"
+    ).fetchall()
+    assert rows == [("ABP-001", "日文标题", "日文简介")]
+    assert "20260815_03_merge_movie_title_desc_fields" in _schema_migration_names(clean_db)
+
+
+def test_run_pending_migrations_adds_movie_field_owners_columns(clean_db):
+    """20260816_01：movie 增加 field_owners / mutation_revision（服务端默认值）。
+
+    存量行由 PostgreSQL 服务端 DEFAULT 自动填充 '{}' / 0，ALTER 走 metadata-only
+    fast path，不重写整表；新库由 initdb 的 create_tables 按模型渲染出同构列。"""
+    _create_movie_table_missing_title_zh(clean_db)
+    _insert_legacy_movie(clean_db, "ABP-001", "javdb-001", "A 系列")
+
+    run_pending_migrations(clean_db)
+
+    columns = {column.name for column in clean_db.get_columns("movie")}
+    assert "field_owners" in columns
+    assert "mutation_revision" in columns
+    # 服务端默认值对存量行生效（::text 避免 jsonb 解析适配差异）。
+    row = clean_db.execute_sql(
+        "SELECT field_owners::text, mutation_revision FROM movie WHERE movie_number = %s",
+        ("ABP-001",),
+    ).fetchone()
+    assert row[0] == "{}"
+    assert row[1] == 0
+    assert "20260816_01_add_movie_field_owners" in _schema_migration_names(clean_db)
+
+    # 幂等：重跑不改变数据，迁移记录已存在。
+    second_summary = run_pending_migrations(clean_db)
+    assert second_summary.applied_count == 0

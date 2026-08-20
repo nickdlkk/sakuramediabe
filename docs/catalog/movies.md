@@ -18,7 +18,7 @@
 - `POST /movies/{movie_number}/metadata-refresh`：严格刷新本地已有影片的远端元数据
 - `POST /movies/{movie_number}/heat-recompute`：手动重算单部影片热度
 
-> 单片翻译 / 互动同步端点已删除：统一走 `POST /system/resource-task-actions` 的
+> 单片互动同步端点已删除：统一走 `POST /system/resource-task-actions` 的
 > `rerun`（`resource_ids=[movie_id]`，202 入队语义），见
 > [任务中心文档](../system/task-runs.md)。
 - `GET /movies`：分页查询影片列表
@@ -47,7 +47,6 @@
   "javdb_id": "MovieA1",
   "movie_number": "ABC-001",
   "title": "Movie 1",
-  "title_zh": "电影 1",
   "series_id": 1,
   "series_name": "Series 1",
   "cover_image": {
@@ -79,13 +78,11 @@
 }
 ```
 
-影片详情（`MovieDetailResource`）沿用摘要中的 `title_zh`、`cover_image`、`thin_cover_image`，并额外增加：
+影片详情（`MovieDetailResource`）沿用摘要中的 `cover_image`、`thin_cover_image`，并额外增加：
 
 - `actors`: `MovieActorResource[]`
 - `tags`: `TagResource[]`
-- `summary`: `string`
-- `desc`: `string`（日文原文描述）
-- `desc_zh`: `string`（中文翻译描述）
+- `summary`: `string`（摘要；`desc` / `desc_zh` 存量数据已迁移至此，中文描述优先）
 - `maker_name`: `string | null`（厂商名称）
 - `director_name`: `string | null`（导演名称）
 - `plot_images`: `ImageResource[]`
@@ -98,12 +95,24 @@
   （`POST /system/resource-task-actions` 的 `resource_ids`）收的是这个 id，列表与详情都会返回
 - `series_name`: 系列名称，可为 `null`
 - `series_id`: 系列 ID，可为 `null`；系列名来自独立 `movie_series` 表
-- `title`：原始标题
-- `title_zh`：中文标题；为空字符串表示尚未翻译
+- `title`：标题；翻译链路下线后，存量 `title_zh`（中文标题）已合并进本字段
 - `thin_cover_image`：优先由封面图裁切生成；若裁切失败，则回退到前两张剧情图中的第一张竖图；若仍未命中则为 `null`
 - `heat`: 影片热度值，整数且非空；默认 `0`
 - `score`、`score_number`、`watched_count`、`want_watch_count`、`comment_count` 会由定时互动同步任务定期从 JavDB 回刷
-- `desc`、`desc_zh`、`maker_name`、`director_name` 仅在详情接口返回，列表接口不返回这些字段
+- `maker_name`、`director_name` 仅在详情接口返回，列表接口不返回这些字段
+
+影片热度使用累计关注度公式（当前版本 `v6`）：
+
+```text
+W = watched_count / 1308
+I = want_watch_count / 4991
+C = comment_count / 41
+R = score_number / 6291
+
+heat = ROUND(3100 × (7/34 × W + 5/34 × I + 17/34 × C + 5/34 × R))
+```
+
+参考值固定为当前业务库互动数据的 P99，不随每日全库重算动态变化；`3100` 只是 P99 附近的展示基准，不是上限，P99 以上的影片继续按原始计数线性增长。评论数占 50%，`score` 本身表示平均评分，不参与关注度计算。
 
 `MovieMediaResource`：
 
@@ -276,7 +285,6 @@ Authorization: Bearer <token>
     "javdb_id": "MovieA1",
     "movie_number": "FC2-PPV-123456",
     "title": "Movie 1",
-    "title_zh": "电影 1",
     "series_name": null,
     "cover_image": null,
     "thin_cover_image": null,
@@ -323,7 +331,6 @@ Authorization: Bearer <token>
     "javdb_id": "MovieA2",
     "movie_number": "FC2-PPV-654321",
     "title": "Movie 2",
-    "title_zh": "电影 2",
     "series_name": null,
     "cover_image": null,
     "thin_cover_image": null,
@@ -397,8 +404,6 @@ Content-Type: application/json
     - 封面、剧情图、当前演员列表中的演员头像会强制重下，不复用旧文件
     - `thin_cover_image` 会基于最新封面和剧情图重新计算：优先裁切封面，失败时回退到前两张剧情图中的第一张竖图；仍未命中则清空
   - 不会刷新：
-    - `desc`
-    - `desc_zh`
     - `movie_number`
     - 订阅状态、合集状态、热度等本地状态字段
   - 远端查不到番号时返回 `404 movie_metadata_not_found`
@@ -423,7 +428,6 @@ Authorization: Bearer <token>
   "javdb_id": "MovieA1",
   "movie_number": "ABP-123",
   "title": "Movie 1",
-  "title_zh": "电影 1",
   "series_id": 1,
   "series_name": "Series 1",
   "cover_image": {
@@ -448,8 +452,6 @@ Authorization: Bearer <token>
   "actors": [],
   "tags": [],
   "summary": "summary",
-  "desc": "",
-  "desc_zh": "",
   "maker_name": "maker",
   "director_name": "director",
   "thin_cover_image": null,
@@ -459,15 +461,14 @@ Authorization: Bearer <token>
 }
 ```
 
-### 单片翻译 / 互动同步（已并入统一 action 协议）
+### 单片互动同步（已并入统一 action 协议）
 
-`POST /movies/{movie_number}/desc-translation` 与
-`POST /movies/{movie_number}/interaction-sync` 已删除。对等调用：
+`POST /movies/{movie_number}/interaction-sync` 已删除（影片简介翻译链路整体下线）。对等调用：
 
 ```json
 POST /system/resource-task-actions
 {
-  "task_key": "movie_desc_translation",
+  "task_key": "movie_interaction_sync",
   "action": "rerun",
   "resource_ids": [movie_id]
 }
@@ -475,12 +476,10 @@ POST /system/resource-task-actions
 
 - `resource_ids` 收整数影片主键，取影片摘要 / 详情响应里的 `id` 字段（不是 `movie_number`，
   也不是 `javdb_id`）
-- `rerun` 是强制语义：已翻译影片会重新翻译并覆盖 `desc_zh`；互动同步不受批量调度
-  刷新窗口限制（`task_key` 换 `movie_interaction_sync`）
+- `rerun` 是强制语义：互动同步不受批量调度刷新窗口限制
 - 202 入队语义：执行在 worker，响应携带 `task_run_id`，前端经 SSE / 单条查询跟进后
   刷新影片详情
-- 影片缺原始简介 / 缺 JavDB ID 由合格性钩子逐条跳过（`movie_desc_missing` /
-  `movie_javdb_id_missing`），不再返回 422
+- 影片缺 JavDB ID 由合格性钩子逐条跳过（`movie_javdb_id_missing`），不再返回 422
 
 ### `POST /movies/{movie_number}/heat-recompute`
 
@@ -545,6 +544,8 @@ Authorization: Bearer <token>
   - `200 OK`
   - `Content-Type: text/event-stream`
   - 事件顺序与演员流式接口一致，最终结果看 `completed`
+- 导入语义：**纯新建**——影片已存在时跳过不更新任何字段（`already_exists_count` 计数），
+  需要按 JavDB 全量刷新已存在影片请用 `POST /movies/{movie_number}/metadata-refresh`。
 - 事件顺序：
   - `search_started`
   - `movie_found`
@@ -580,7 +581,7 @@ event: upsert_finished
 data: {"total":1,"created_count":1,"already_exists_count":0,"failed_count":0}
 
 event: completed
-data: {"success":true,"movies":[{"javdb_id":"javdb-ABP-123","movie_number":"ABP-123","title":"title-ABP-123","title_zh":"","cover_image":null,"thin_cover_image":null,"release_date":null,"duration_minutes":0,"score":0.0,"watched_count":0,"want_watch_count":0,"comment_count":0,"score_number":0,"is_collection":false,"is_subscribed":false}],"failed_items":[],"stats":{"total":1,"created_count":1,"already_exists_count":0,"failed_count":0}}
+data: {"success":true,"movies":[{"javdb_id":"javdb-ABP-123","movie_number":"ABP-123","title":"title-ABP-123","cover_image":null,"thin_cover_image":null,"release_date":null,"duration_minutes":0,"score":0.0,"watched_count":0,"want_watch_count":0,"comment_count":0,"score_number":0,"is_collection":false,"is_subscribed":false}],"failed_items":[],"stats":{"total":1,"created_count":1,"already_exists_count":0,"failed_count":0}}
 ```
 
 未找到事件流示例：
@@ -662,7 +663,7 @@ event: upsert_finished
 data: {"total":2,"created_count":1,"already_exists_count":1,"failed_count":0}
 
 event: completed
-data: {"success":true,"movies":[{"javdb_id":"javdb-new","movie_number":"ABP-002","title":"New","title_zh":"","cover_image":null,"thin_cover_image":null,"release_date":null,"duration_minutes":0,"score":0.0,"watched_count":0,"want_watch_count":0,"comment_count":0,"score_number":0,"is_collection":false,"is_subscribed":false}],"skipped_items":[{"javdb_id":"javdb-existing","movie_number":"ABP-001","reason":"already_exists"}],"failed_items":[],"stats":{"total":2,"created_count":1,"already_exists_count":1,"failed_count":0}}
+data: {"success":true,"movies":[{"javdb_id":"javdb-new","movie_number":"ABP-002","title":"New","cover_image":null,"thin_cover_image":null,"release_date":null,"duration_minutes":0,"score":0.0,"watched_count":0,"want_watch_count":0,"comment_count":0,"score_number":0,"is_collection":false,"is_subscribed":false}],"skipped_items":[{"javdb_id":"javdb-existing","movie_number":"ABP-001","reason":"already_exists"}],"failed_items":[],"stats":{"total":2,"created_count":1,"already_exists_count":1,"failed_count":0}}
 ```
 
 未找到本地系列事件流示例：
@@ -685,9 +686,11 @@ data: {"success":false,"reason":"local_series_not_found","movies":[]}
   - `director_name`：按导演名称精确过滤（可选；会先 `strip`）
   - `maker_name`：按厂商名称精确过滤（可选；会先 `strip`）
   - `year`：按发行年份过滤（可选，只支持单个年份）
-  - `status`：按影片状态过滤（可选，`all | subscribed | playable`，默认 `all`）
+  - `status`：按影片状态过滤（可选，`all | subscribed | unsubscribed | playable`，默认 `all`）
   - `collection_type`：按合集类型过滤（可选，`all | single`，默认 `all`；`single` 表示 `is_collection=false`）
   - `special_tag`：按特殊标签过滤（可选，`4k | uncensored | vr`）
+  - `heat_min`：热度下限（可选，整数且 `>= 0`，闭区间）；与 `heat_max` 配合实现热度范围过滤，如 `heat_min=40&heat_max=80`；仅传下限时表示热度无上界，未同步热度（`heat=0`）的影片会被排除
+  - `heat_max`：热度上限（可选，整数且 `>= 0`，闭区间）；仅传上限时会把未同步热度（`heat=0`）的影片一并包含，需要明确下界时请配合 `heat_min`
   - `sort`：排序表达式（可选，格式 `field:direction`）
     - `field` 支持：`release_date`、`added_at`、`subscribed_at`、`comment_count`、`score_number`、`want_watch_count`、`heat`
     - `direction` 支持：`asc | desc`
@@ -703,9 +706,11 @@ data: {"success":false,"reason":"local_series_not_found","movies":[]}
   - `director_name`、`maker_name` 均为精确匹配，空白值返回 422 `invalid_movie_filter`
   - `year` 只返回 `release_date` 落在该自然年的影片
   - `status=subscribed` 只返回已订阅影片
+  - `status=unsubscribed` 只返回未订阅影片
   - `status=playable` 只返回存在有效媒体的影片
   - `collection_type=single` 只返回 `is_collection=false` 的影片
   - `special_tag=4k` 只返回存在有效 `4K` 媒体的影片；`uncensored`、`vr` 同理
+  - `heat_min` / `heat_max` 只返回热度落在 `[heat_min, heat_max]` 闭区间内的影片；`heat_min > heat_max` 返回 422 `invalid_movie_filter`
 
 示例请求：
 
@@ -719,6 +724,10 @@ GET /movies?status=subscribed&page=1&page_size=20
 
 ```http
 GET /movies?actor_id=1&status=playable&page=1&page_size=20
+```
+
+```http
+GET /movies?status=unsubscribed&heat_min=40&heat_max=80&sort=heat:desc&page=1&page_size=20
 ```
 
 ```http
@@ -1078,6 +1087,53 @@ Authorization: Bearer <token>
 }
 ```
 
+### 手动字幕导入
+
+支持用户把按番号命名的 `.srt` 放进服务器某个目录（浏览白名单 `media_import.browse_roots` 内），
+在 GUI 里选择该目录后由后端递归扫描并归档到对应影片的字幕目录。异步执行，进度走
+`/system/events/stream`，失败文件支持改名后重导。
+
+**命名规则（v1）**：
+
+- 只接受 `.srt`（后缀大小写不敏感），不支持 `.ass` / `.ssa` / `.vtt`
+- 番号必须写在**文件名里**，父目录名不参与识别
+- 文件名中必须能解析出一个番号，解析不出则进入失败列表，改名后重导
+- 番号以外的内容随意（语种标记、分辨率、字幕组、括号序号、年份等）
+- 一个文件只写一个番号：解析器按规则顺序取第一条命中，多个番号结果不可预期
+
+识别口径复用 `src/common/movie_numbers.py` 的 `parse_movie_number_from_text()`，大小写不敏感，
+`-` / `_` / 空格分隔都能识别；匹配影片时复用 `find_movie_by_number()`（大小写、分隔符宽松）。
+示例：
+
+| 用户命名 | 识别出的番号 | 结果 |
+|---|---|---|
+| `ABP-123.srt` / `abp-123.srt` | `ABP-123` | 导入 |
+| `ABC-001 4K 中文字幕.srt` | `ABC-001` | 导入 |
+| `ABC123.srt` / `ABC 123.srt` | `ABC-123` | 导入 |
+| `[字幕组] ABP-123.cht.SRT` | `ABP-123` | 导入 |
+| `FC2PPV-123456.srt` / `FC2-PPV-123456.srt` | `FC2-123456` | 导入 |
+| `01.srt` / `sub.srt` / `中文字幕.srt` | （空） | 失败 |
+
+**导入行为**：
+
+- 递归扫描所选目录（也可直接选单个 `.srt` 文件），只处理 `.srt`，其它文件忽略
+- 归档到 `<图片根>/movies/{shard}/{番号}/subtitles/<番号>-<N>.srt` 并登记 `Subtitle`，
+  源文件始终保留（硬链接优先、复制兜底，不删源）
+- 同一影片已存在相同内容（sha256 相同）的字幕时跳过，不重复导入
+- 源文件名里的 `.chs` / `.cht` 等标注**不会**保留到字幕列表，只显示 `<番号>-<N>.srt`
+- 解析不出番号 / 库中无对应影片 / 搬运登记异常进入失败列表（`kind=file`，可改名/删除/重导）；
+  目录里没有任何 `.srt` 时作业判失败并给出任务级失败原因
+
+接口（均需 Bearer Token）：
+
+- `POST /subtitle-imports`：创建字幕导入作业，body `{"source_path": "<绝对路径>"}`，返回 `202`
+- `GET /subtitle-imports`：分页列表
+- `GET /subtitle-imports/{subtitle_import_job_id}`：作业详情（含失败文件）
+- `POST /subtitle-imports/{subtitle_import_job_id}/retry`：重导失败文件
+- `POST /subtitle-imports/{subtitle_import_job_id}/rerun`：整作业重跑
+- `DELETE /subtitle-imports/{subtitle_import_job_id}/failed-files`：删除失败源文件
+- `POST /subtitle-imports/{subtitle_import_job_id}/failed-files/rename`：重命名失败源文件
+
 ### `PUT /movies/{movie_number}/subscription`
 
 - 鉴权：需要 Bearer Token
@@ -1192,7 +1248,6 @@ GET /movies/ABC-001
   "javdb_id": "MovieA1",
   "movie_number": "ABC-001",
   "title": "Movie 1",
-  "title_zh": "电影 1",
   "series_id": 1,
   "series_name": "Series 1",
   "cover_image": null,
@@ -1284,8 +1339,6 @@ GET /movies/ABC-001
 常见错误码：
 
 - `movie_not_found`：影片不存在（404）
-- `movie_desc_missing`：影片缺少可翻译的原始简介（422）
-- `movie_desc_translation_unavailable`：影片简介翻译服务不可达（503，实际错误码以上游返回为准）
 - `movie_interaction_sync_failed`：影片互动数同步失败（502）
 - `movie_javdb_id_missing`：影片缺少 JavDB ID，无法同步互动数（422）
 - `movie_heat_recompute_failed`：影片热度重算失败（500）

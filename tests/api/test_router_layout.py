@@ -10,7 +10,7 @@ from src.api.exception.errors import ApiError
 from src.api.exception.exception import api_error_handler
 from src.api.routers import deps
 from src.api.routers.catalog import subscriptions as movie_subscriptions
-from src.api.routers.catalog import tags
+from src.api.routers.catalog import subtitle_imports, tags
 from src.api.routers.discovery import hot_reviews, image_search, ranking_sources
 from src.api.routers.files import images
 from src.api.routers.playback import media as media_router
@@ -20,7 +20,7 @@ from src.api.routers.system import (
     activity,
     auth,
     indexer_settings,
-    movie_desc_translation_settings,
+    plugins,
     status,
 )
 from src.api.routers.system import config as system_config
@@ -78,6 +78,15 @@ def test_media_import_router_uses_auth_and_db_dependencies():
     assert deps.get_current_user in dependency_targets
 
 
+def test_subtitle_imports_router_uses_auth_and_db_dependencies():
+    dependency_targets = {
+        dependency.dependency for dependency in subtitle_imports.router.dependencies
+    }
+
+    assert deps.db_deps in dependency_targets
+    assert deps.get_current_user in dependency_targets
+
+
 def test_rapid_uploads_router_uses_auth_and_db_dependencies():
     dependency_targets = {
         dependency.dependency
@@ -115,13 +124,13 @@ def test_indexer_settings_router_uses_db_deps_as_router_level_dependency():
     )
 
 
-def test_movie_desc_translation_settings_router_uses_db_deps_as_router_level_dependency():
-    assert hasattr(deps, "db_deps")
-    assert any(
-        isinstance(dependency.dependency, type(deps.db_deps))
-        or dependency.dependency is deps.db_deps
-        for dependency in movie_desc_translation_settings.router.dependencies
-    )
+def test_plugins_router_uses_auth_and_db_dependencies():
+    dependency_targets = {
+        dependency.dependency for dependency in plugins.router.dependencies
+    }
+
+    assert deps.db_deps in dependency_targets
+    assert deps.get_current_user in dependency_targets
 
 
 def test_config_router_uses_db_deps_as_router_level_dependency():
@@ -223,6 +232,18 @@ def test_create_app_registers_videos_routes():
     assert "/video-imports" in paths
 
 
+def test_create_app_registers_subtitle_import_routes():
+    app = create_app()
+    paths = {getattr(route, "path", None) for route in app.routes}
+
+    assert "/subtitle-imports" in paths
+    assert "/subtitle-imports/{subtitle_import_job_id}" in paths
+    assert "/subtitle-imports/{subtitle_import_job_id}/retry" in paths
+    assert "/subtitle-imports/{subtitle_import_job_id}/rerun" in paths
+    assert "/subtitle-imports/{subtitle_import_job_id}/failed-files" in paths
+    assert "/subtitle-imports/{subtitle_import_job_id}/failed-files/rename" in paths
+
+
 def test_openapi_uses_oauth2_password_flow_for_authorize_button():
     app = create_app()
     schema = app.openapi()
@@ -266,8 +287,8 @@ def test_create_app_registers_image_search_routes():
     assert "/movies/{movie_number}/interaction-sync" not in paths
     assert "/movies/{movie_number}/heat-recompute" in paths
     assert "/movies/series/{series_id}/javdb/import/stream" in paths
-    # GET/PATCH 已剔除；此路由现在只暴露连通性探测端点。
-    assert "/movie-desc-translation-settings/test" in paths
+    # 翻译链路已整体下线：设置探测端点一并移除。
+    assert "/movie-desc-translation-settings/test" not in paths
     assert "/system/activity/bootstrap" in paths
     assert "/system/notifications" in paths
     assert "/system/task-runs" in paths
@@ -546,6 +567,7 @@ def test_create_app_registers_download_task_center_routes():
 
     assert ("/download-tasks", "GET") in route_methods
     assert ("/download-tasks/stream", "GET") in route_methods
+    assert ("/download-tasks/{task_id}/files", "GET") in route_methods
     assert ("/download-tasks/{task_id}/pause", "POST") in route_methods
     assert ("/download-tasks/{task_id}/resume", "POST") in route_methods
     assert ("/download-tasks/{task_id}", "DELETE") in route_methods
@@ -598,48 +620,6 @@ def test_create_app_initializes_database_proxy_before_runtime_startup_jobs(monke
     assert events == [
         "db.ready",
         "recover",
-    ]
-
-
-def test_create_app_recovers_task_related_business_running_states_on_startup(monkeypatch):
-    events = []
-
-    def fake_recover_interrupted_task_runs(**kwargs):
-        events.append(("recover", kwargs["trigger_type"]))
-        if kwargs["trigger_type"] == "startup":
-            return [type("TaskRun", (), {"task_key": "movie_desc_sync"})()]
-        if kwargs["trigger_type"] == "manual":
-            return [type("TaskRun", (), {"task_key": "movie_desc_translation"})()]
-        if kwargs["trigger_type"] == "internal":
-            return [type("TaskRun", (), {"task_key": "download_task_import"})()]
-        return []
-
-    monkeypatch.setattr("src.start.recovery.ActivityService.recover_interrupted_task_runs", fake_recover_interrupted_task_runs)
-    monkeypatch.setattr(
-        "src.start.recovery.MovieDescSyncService.recover_interrupted_running_movies",
-        lambda **kwargs: events.append(("recover_desc", kwargs["error_message"])) or 1,
-    )
-    monkeypatch.setattr(
-        "src.start.recovery.MovieDescTranslationService.recover_interrupted_running_movies",
-        lambda **kwargs: events.append(("recover_translation", kwargs["error_message"])) or 1,
-    )
-    monkeypatch.setattr(
-        "src.start.recovery.DownloadSyncService.recover_orphaned_imports_only",
-        lambda self: events.append(("recover_import", True)) or {"recovered_count": 1},
-    )
-
-    app = create_app()
-
-    with TestClient(app):
-        pass
-
-    assert events == [
-        ("recover", "startup"),
-        ("recover", "manual"),
-        ("recover", "internal"),
-        ("recover_desc", "影片描述抓取任务中断，等待重试"),
-        ("recover_translation", "影片简介翻译任务中断，等待重试"),
-        ("recover_import", True),
     ]
 
 

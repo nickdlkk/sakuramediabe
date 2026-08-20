@@ -12,7 +12,7 @@
 `POST /movies/unsubscriptions`。**批量取消订阅就用那边的 `POST /movies/unsubscriptions`**，本域
 不另造一套；要连本地媒体文件一起删的走 `DELETE /media/{media_id}`。
 
-资源查询本身的行为（查询次数与放弃、死种判定、选种黑名单）见
+资源查询本身的行为（没找到次数与放弃、死种判定、选种黑名单）见
 [transfers/downloads.md](../transfers/downloads.md) 的「内部定时任务」。
 
 ## 资源模型
@@ -22,7 +22,6 @@
   "movie_id": 123,
   "movie_number": "ABP-123",
   "title": "…",
-  "title_zh": "…",
   "cover_image": { "id": 1, "origin": "…", "small": "…", "medium": "…", "large": "…" },
   "release_date": "2019-05-01",
   "subscribed_at": "2026-01-02T03:04:05",
@@ -44,7 +43,8 @@
 - `status`：资源状态，取值见下表
 - `is_fresh`：是否算新片（`release_date` 在 90 天内，含未来日期）。新片每轮都查、**不计次数、
   永不放弃**，所以它为 `true` 时 `attempt_count` 恒为 `0`，前端该展示「持续查询中」而不是次数
-- `attempt_count` / `attempt_limit`：老片已查次数与上限（默认 3）
+- `attempt_count` / `attempt_limit`：老片本轮没找到资源的次数与放弃阈值（默认 3）。
+  成功找到资源后计数清零，所以下载中 / 已入库等状态恒为 0
 - `dead_download_task_count`：该影片试过并判死的种子数
 - `last_error`：仅 `status=failed` 时有值，为索引器调用的错误详情
 
@@ -53,9 +53,9 @@
 七项由服务端**一个** SQL CASE 表达式判定（`MovieSubscriptionService._status_expression()`），
 筛选、计数、列表展示共用它。因此各状态严格互斥，`/status-counts` 各项之和恒等于 `total`。
 
-⚠️ **`import_failed`（导入失败）与 `failed`（查询出错）是两回事**：前者是种子下完了、文件已经在
-盘上，卡在入库那一步；后者是索引器调用出错、压根还没找到资源。前端文案必须分别念作「导入失败」
-与「查询出错」，别都写成「失败」。
+⚠️ **`import_failed` 是「未入库」操作桶，不等于每条都发生了异常**：其中可能是真正导入失败，
+也可能是导入作业正常结束但零媒体产出（例如全部候选都被跳过）。前者在行内显示「导入失败」，
+后者显示「未产出媒体」；`failed`（查询出错）仍是另一件事。
 
 `downloading` 与 `import_failed` 是对「有活跃下载任务」这一集合的**二分**——两者并集恒等于该集合，
 所以这次细分不改变任何影片的归属，只是把原来的一个桶一分为二。这条不变量必须守住：
@@ -78,8 +78,8 @@
 | `imported` | 已入库 | 存在 `Media` |
 | `downloading` | 下载中 | 无 `Media`，存在活跃 `DownloadTask` 且其中有 `import_status=pending/running` 的 |
 | `import_failed` | 导入失败 | 无 `Media`，存在活跃 `DownloadTask` 但没有一个还在途（导入跑完了，库里没有） |
-| `exhausted` | 已放弃 | 老片查询次数用尽，需手动重置 |
-| `failed` | 查询出错 | 索引器调用失败，不消耗次数，下轮重试 |
+| `exhausted` | 已放弃 | 老片本轮没找到次数达到上限（默认 3），需手动重置 |
+| `failed` | 查询出错 | 索引器调用失败，不计入本轮没找到次数，下轮重试 |
 | `missing` | 缺资源 | 查过但没找到可用资源，下轮继续查 |
 | `pending` | 待查 | 从未查过资源 |
 
@@ -118,6 +118,18 @@ Query：
 `attempt_count:desc`。空值统一排到最后。
 
 响应：`PageResponse<MovieSubscriptionListItemResource>`。
+
+`import_failed` 档的 `import_operation` 除作业 id、计数与 `available_actions` 外，
+还返回 `outcome`（`failed` / `no_media`），用于区分真正失败与零产出，以及首条失败条目的
+`failure_reason`（原始码，如 `no_media_files_found`）与
+`failure_detail`（如"下载目录中没有扫描到可导入的视频"），供订阅行直接展示
+"为什么没导进去"；没有失败条目时两者为 `null`。详细 `failed_files`（含每条路径）
+仍在导入作业详情接口 `GET /media-imports/import-jobs/{import_job_id}` 返回。
+
+`import_operation.download_task_id` 是该失败导入关联的下载任务 id；存在时
+`available_actions` 额外下发 `delete_failed_download`——订阅行据此复用下载中心的
+删除任务语义：删除后影片不再有活跃下载任务，状态回到「缺资源」，下一轮自动下载
+cron 会重新找种（内容闸门会避开原盘类候选）。
 
 ### `GET /movie-subscriptions/status-counts`
 

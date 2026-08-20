@@ -2,7 +2,7 @@
 
 ## 资源说明
 
-下载域负责对接 Jackett、qBittorrent 与 115 离线下载，并管理本地可查询的下载状态。
+下载域负责对接 Torznab 索引器、qBittorrent 与 115 离线下载，并管理本地可查询的下载状态。
 
 下载入口按 `DownloadClient.kind` 区分两种：
 
@@ -11,7 +11,7 @@
 
 所有时间字段都由后端按当前运行环境时区转换后返回，格式为不带时区后缀的本地时间字符串。
 
-- Jackett 负责“搜索候选资源”
+- Torznab 索引器负责“搜索候选资源”
 - qBittorrent 负责“实际下载”
 - `DownloadTask` 是本地镜像数据，由“提交下载”或“同步任务”流程写入
 - API 不提供 `DownloadTask` 的通用创建、更新、详情接口；只提供查询、实时状态与受控操作
@@ -22,6 +22,8 @@
 - 索引器配置继续使用系统级接口 `/indexer-settings`
 - 下载客户端配置使用下载域接口 `/download-clients`
 - 搜索结果 `DownloadCandidate` 为临时资源，不落库
+- 搜索返回前按候选标题/描述解析番号做一致性过滤：解析出的番号与请求不一致的候选直接剔除，
+  解析不出番号的候选保留（单文件种子可能靠落盘后的父目录番号兜底）
 - 提交下载使用命令式接口 `POST /download-requests`
 - 提交前一律经过种子内容闸门（见下「种子内容闸门」），手动提交与自动下载共用同一道校验
 - 定时任务可自动搜索“已订阅但缺失媒体且没有下载记录”的影片，并自动提交下载
@@ -29,9 +31,9 @@
 ## 设计目标
 
 - 保持依赖方向为 `api -> service -> model`
-- 让 Jackett 配置与 qBittorrent 客户端配置解耦
+- 让索引器配置与 qBittorrent 客户端配置解耦
 - 让搜索、提交下载、任务同步、媒体导入分成独立流程
-- 允许一个系统级 Jackett 配置服务多个 `DownloadClient`
+- 允许一套索引器配置服务多个 `DownloadClient`
 - 允许多个 `DownloadClient` 绑定不同媒体库
 - 支持后续增加定时同步与自动导入，而不破坏 API 边界
 - 支持后续增加自动搜索订阅影片资源，而不新增额外下载 API
@@ -44,8 +46,8 @@
 
 - 仅处理 `is_subscribed = true` 的影片
 - 仅处理不存在有效 `Media` 且**不存在活跃 `DownloadTask`** 的影片（判定的是活跃而非存在，见下「死种判定」）
-- 仅处理**尚未放弃**的影片（`state != exhausted`，见下「查询次数与放弃」）
-- 使用 Jackett 搜索 PT 与 BT 候选资源
+- 仅处理**尚未放弃**的影片（`state != exhausted`，见下「没找到次数与放弃」）
+- 使用 Torznab 协议搜索 PT 与 BT 候选资源
 - 选种为「过滤 → 打分取最高」两步，与 `downloads.preferred_client_kinds` 无关（见下）
 - 复用 `POST /download-requests` 对应的 service 提交下载，不新增 API
 
@@ -56,15 +58,19 @@
 3. `info_hash` 命中该影片选种黑名单的剔除（见下「选种黑名单」；`info_hash` 未知的照常放行）
 4. `seeders = 0` 的剔除
 
+搜索阶段已按标题/描述做过番号一致性过滤（见上「边界说明」），选种过滤只处理剩余候选；
+标题解析不出番号的候选保留，其内容一致性由提交阶段的内容闸门兜底。
+
 选种打分：`score = size_bytes + 中字加成（2G）`，取最高分。大小主导；中字加成等价于
 「中字版最多容忍比无中字版小 2G 仍然优先」。分数相同（同一个种子被多个索引器同时返回）时按
 `(indexer_name, title)` 兜底，保证选种确定性——黑名单排除依赖「同一批候选每轮选出同一个」。
 
-提交阶段还会经过种子内容闸门（见下「种子内容闸门」）。被闸门拒绝时**在本轮就地换种**：把该
-候选加入本轮拒绝集合后重选次优，最多换 `MAX_CONTENT_REJECTED_CANDIDATES`（5）次；全部用完
-仍无可提交候选，按「本轮没找到资源」处理并计入查询次数。拒绝集合按
-`(indexer_name, title, size_bytes)` 标识候选而不是 `info_hash`——PT 索引器的 torznab 响应既不给
-`infohash` 也不给磁力，候选身份恒为空串，而原盘恰恰主要出现在 PT 站。**拒绝记录只在本轮内有效**，
+提交阶段还会经过种子内容闸门（见下「种子内容闸门」），并在同一拉 .torrent 的解析里补全
+torrent-only 候选的 `info_hash` 做死种黑名单比对。被内容闸门或死种黑名单拒绝时**在本轮就地换种**：
+把该候选加入本轮拒绝集合后重选次优，最多换 `MAX_REJECTED_CANDIDATES`（5）次；全部用完
+仍无可提交候选，按「本轮没找到资源」处理并计入本轮没找到次数。拒绝集合按
+`(indexer_name, title, size_bytes)` 标识候选而不是 `info_hash`——PT 索引器可能连
+`infohash` 和磁力都不给，候选身份要等提交阶段解析 .torrent 才确定。**拒绝记录只在本轮内有效**，
 跨轮不记忆：下一轮该影片会重新拉一次这些种子文件再拒一次。
 
 说明：
@@ -157,7 +163,8 @@
 ### 种子内容闸门
 
 `POST /download-requests` 对应的 `DownloadRequestService.create_request` 在分派下载器**之前**，
-先拉取候选的 `.torrent` 并解析文件列表，内容不可导入时直接拒绝提交。实现在
+先拉取候选的 `.torrent` 并解析文件列表，内容不可导入时直接拒绝提交；**只有磁力链的候选
+直接放行**（内容校验推迟到导入阶段，见下）。实现在
 `src/service/transfers/downloads/guards/torrent_content_guard.py`。qB 与 115 共用这个入口，自动下载与手动提交
 也都走它，因此这是唯一需要维护的拦截点。
 
@@ -166,6 +173,8 @@
 
 - `0` → 拒绝，典型是蓝光/DVD 原盘（正片是单个 `.iso`）
 - 合格视频解析出的**不同番号数 > 1** → 拒绝，典型是演员合集包
+- 合格视频解析出的番号集合非空且**不包含请求番号** → 拒绝，典型是标题为 JOB-033 的种子
+  内容实际为 CJOB-033（文件路径 `cjob00033/...`），提交后导入侧也会把它归到 CJOB-033
 
 番号判定逐文件复用导入侧 `parse_movie_number_from_scan_path`（只看父目录 + 文件名最后两段），
 并对种子内相对路径垫一个虚拟根段，使解析口径与落盘后的绝对路径完全对齐——无根目录、番号只在
@@ -177,8 +186,9 @@
 
 判据直接复用导入侧的两条约束，因此闸门拒绝的一定是导入侧也会丢弃的（反过来不成立：导入侧
 还要求能从路径解析出番号，见 `media_source_scanner.parse_movie_number_from_scan_path`，闸门对
-解析不出番号的资源是放行的）。方向上只会漏、不会误拒；将来支持新容器格式或调整体积阈值，闸门自动跟随，
-**不需要维护任何格式关键词表**。
+解析不出番号的资源是放行的）。番号一致性判据与导入侧路径解析共用同一套解析函数，因此“闸门
+解析出与请求不一致”时，导入侧必然也会把文件归到别的影片，拒绝是确定的而非误杀；将来支持新容器
+格式或调整体积阈值，闸门自动跟随，**不需要维护任何格式关键词表**。
 
 为什么必须读文件列表（SSIS-037 生产实测，38 个候选 / 去重后 33 个种子）：
 
@@ -194,36 +204,43 @@
 两类错误码，区别只体现在给 HTTP 调用方的语义上；**自动下载对两者一视同仁地换种**：
 
 - `download_candidate_content_rejected`（422）：内容确定不合格
-- `download_candidate_content_unverifiable`（502）：拿不到或解析不了种子文件
+- `download_candidate_content_unverifiable`（502）：有 `.torrent` 地址但拿不到或解析不了种子文件
+  （纯磁力候选已不抛此错误——直接放行，见下）
 
 不可校验之所以也换种而不是中止该影片：中止要走 `consumes_budget=False`，而它会回滚重试计数且
 **永不判 exhausted**（`ResourceTaskRunner._finish_failed`），稳定复现的坏候选会让这部影片每轮
-重来、永远放弃不掉。换种则会在候选耗尽时正常落到「本轮没找到资源」并消耗查询次数，可收敛。
+重来、永远放弃不掉。换种则会在候选耗尽时正常落到「本轮没找到资源」并消耗本轮没找到次数，可收敛。
 索引器整体故障不会走到这里——那种情况 `search_candidates` 会先失败并按 `indexer_search_failed`
 处理（那才是真正的基础设施故障，不消耗次数）。
 
-拉取策略：`FETCH_ATTEMPTS = 2`、`FETCH_TIMEOUT_SECONDS = 20`。Jackett 的 `/dl/` 端点要回源到
-上游站点，偶发超时是常态，重试即可恢复；生产实测串行重试下 33/33 全部可得（并发压测时会出现
-瞬时失败，因此闸门刻意逐个候选串行校验）。次数与超时压得紧，是因为单候选的最坏耗时会被换种
-次数放大（最坏 5 × 2 × 20s）。
+拉取策略：`FETCH_ATTEMPTS = 2`、`FETCH_TIMEOUT_SECONDS = 20`。Torznab 聚合器（如 Jackett）
+的 `/dl/` 下载端点要回源到上游站点，偶发超时是常态，重试即可恢复；生产实测串行重试下
+33/33 全部可得（并发压测时会出现瞬时失败，因此闸门刻意逐个候选串行校验）。次数与超时压得紧，
+是因为单候选的最坏耗时会被换种次数放大（最坏 5 × 2 × 20s）。
 
-**日志与 `ApiError.details` 里绝不能出现原始下载地址。** Jackett 的下载链接形如
-`http://host:9117/dl/<indexer>/?jackett_apikey=<KEY>&...`，apikey 就在 query 里；httpx 的异常
-字符串也会内嵌完整 URL，而 `details` 会被 API 层原样返回给调用方。因此 URL 一律经 `_redact_url`
-去 query，异常一律经 `_describe_fetch_error` 压成「类型名 / HTTP 状态码」。
+**日志与 `ApiError.details` 里绝不能出现原始下载地址。** Torznab 服务返回的下载地址通常自带
+鉴权参数（Jackett 形如 `http://host:9117/dl/<indexer>/?jackett_apikey=<KEY>&...`），apikey 就在
+query 里；httpx 的异常字符串也会内嵌完整 URL，而 `details` 会被 API 层原样返回给调用方。
+因此 URL 一律经 `_redact_url` 去 query，异常一律经 `_describe_fetch_error` 压成「类型名 / HTTP 状态码」。
 
-**只有磁力链的候选一律判为不可校验。** 磁力本身不含文件列表，要拿到只能走 BEP-9 从 swarm 换
-metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 67 秒），做不了提交前的同步闸门。
-链接分流**按内容而非字段名**，与 `QBittorrentClient.add_candidate` / `resolve_magnet_from_links`
-保持一致：索引器会把磁力塞进 `torrent_url` 字段，照字段名处理会拿 `magnet:` 当 HTTP 地址去 GET。
+**只有磁力链的候选直接放行。** 磁力本身不含文件列表，要拿到只能走 BEP-9 从 swarm 换
+metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 67 秒），做不了提交前的同步
+闸门，因此不拦、内容校验推迟到下载完成后的导入阶段：原盘（只有 `.iso`）导入时扫不到
+合格视频会明确失败（`ImportJob` failed + `DownloadTask.import_status=failed`），合集包会
+混入媒体库，由用户删任务清理。放行路径的种子身份从磁力 btih 解析——btih 与 `.torrent`
+的 `info_hash` 是同一值，选种黑名单语义不变。链接分流**按内容而非字段名**，与
+`QBittorrentClient.add_candidate` / `resolve_magnet_from_links` 保持一致：索引器会把磁力
+塞进 `torrent_url` 字段，照字段名处理会拿 `magnet:` 当 HTTP 地址去 GET。
 
 #### 选种黑名单
 
 重新查资源时必须排除该影片已判死的种子，否则选种排序是确定性的，会把同一个死种反复选中。
 
 - 黑名单 = 该番号下所有已判死 `DownloadTask` 的 `info_hash`
-- 候选侧的 `info_hash` **在解析索引器响应时就已确定**，选种阶段是纯内存比对，**零网络请求**
-- 排除后无候选 = 本轮没找到资源，正常计入查询次数
+- 候选侧已知的 `info_hash`（torznab infohash / 磁力链）在选种阶段纯内存比对，**零网络请求**；
+  torrent-only 候选在提交阶段由内容闸门解析 `.torrent` 后确认，纯磁力候选在提交阶段由闸门
+  从磁力 btih 解析（放行路径顺带完成），命中的死种按「不合格候选」换下一个
+- 排除后无候选 = 本轮没找到资源，正常计入本轮没找到次数
 - **黑名单是永久的，重置查询状态不放开它。** `info_hash` 是内容寻址的——同一个 hash 就是同一个
   swarm，换个索引器它照样是死的；用户重置后真正想要的是找一个**别的**种子，而黑名单本来就不挡这个。
   确实要重试某个具体种子时，**手动删除该下载任务**（UI 删任务会同步删 qB 侧与本地台账行）——
@@ -231,30 +248,27 @@ metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 
   删掉种子不会解除黑名单；豁免是停滞清理的闭环前提：否则删完种子下轮对账就抹掉黑名单，
   第二天自动下载又把同一死种拉回来。
 
-**种子身份从哪来**（`JackettClient._resolve_info_hash`），按顺序取第一个能用的，两条都是纯字符串处理：
+**种子身份从哪来**：
 
 1. torznab 响应里的 `<torznab:attr name="infohash">` —— 索引器直接给的
 2. 磁力链里的 `xt=urn:btih:`
 
-**绝不为了拿 hash 去下载 `.torrent` 文件。** 那是每候选一次网络往返，而选种阶段只是想知道「这个种子
-我是不是已经试过了」，不值得。生产实测（knaben + sukebei，4 个番号 56 个候选）第 1 条命中率 **100%**，
-第 2 条实际上是给不返回该属性的索引器留的后路。
+前两条都是纯字符串处理，选种阶段不为此发起网络请求。两者都拿不到时 `info_hash` 为空串——
+**空串表示「本次没能廉价地确定身份」，不表示「没有这个种子」**，所以选种时照常放行而不是跳过。
 
-（内容闸门确实会下载 `.torrent`，但它作用在**选种之后的提交阶段**，只针对已经选出的候选，
-不是对整个候选池逐个拉取——每影片最多 `MAX_CONTENT_REJECTED_CANDIDATES`（5）个候选、每候选最多
-`FETCH_ATTEMPTS`（2）次，与这里说的「选种阶段零网络请求」并不冲突。闸门也不回填 `info_hash`：
-黑名单语义保持纯内存比对。）
-
-两者都拿不到时 `info_hash` 为空串——**空串表示「本次没能廉价地确定身份」，不表示「没有这个种子」**，
-所以选种时照常放行而不是跳过：它可能压根不是死种，为一个不确定的判断牺牲一个可用候选不划算；真是死种
-的话，下一轮它带着 `DownloadTask` 行回来，那时身份就是确定的了。
+真正补身份的地方在**提交阶段的内容闸门**：torrent-only 候选本来就要下载 `.torrent` 校验内容，
+顺手把 `torrent_info.info_hash()` 解出来。解析后命中该影片死种黑名单的候选抛
+`download_candidate_dead`，自动下载把它当作「不合格候选」换下一个；全部换完仍无可提交候选时
+才落到 `no_candidate` 正常消耗查询预算。这样既不为整个候选池逐个拉 `.torrent`（每影片最多
+`MAX_REJECTED_CANDIDATES`（5）个候选、每候选最多 `FETCH_ATTEMPTS`（2）次），也堵住了
+「PT 源只给 torrent 链接导致死种被反复重提交」的闭环。
 
 `info_hash` 的规范化统一走 `src/service/transfers/shared/common.py` 的 `canonicalize_btih()`（hex/Base32 →
 40 位小写 hex）。它放在 transfers 公共模块而不是某个下载器模块里：选种、115 离线对账、任务删除、索引器
 候选四条链路都要用，且必须是同一个实现，否则「这两个是不是同一个种子」在不同链路上会给出不同答案。
 实测同一个种子在 knaben（大写 hex）和 sukebei（小写 hex）上会收敛到同一个字符串。
 
-#### 查询次数与放弃
+#### 没找到次数与放弃
 
 避免老片长期没有资源却年复一年地查索引器。状态落在 `ResourceTaskState`
 （`task_key=subscribed_movie_auto_download`，与定时任务同 key；kernel 逐资源记账，
@@ -266,7 +280,7 @@ metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 
 | 档 | 判定 | 节奏 |
 |---|---|---|
 | 新片 | `release_date` 在 `subscription_search_fresh_days`（默认 90 天）内，**含未来日期** | 每轮都查，**不计次数，永不放弃** |
-| 老片 | 其余，含 `release_date` 为空的（无法证明它新） | 每轮都查，累计 `attempt_count`，满 `subscription_search_stale_attempt_limit`（默认 3）置 `exhausted` |
+| 老片 | 其余，含 `release_date` 为空的（无法证明它新） | 每轮都查，累计本轮没找到次数 `attempt_count`，满 `subscription_search_stale_attempt_limit`（默认 3）置 `exhausted` |
 
 即老片**连查 3 天后放弃**。这里刻意不做逐次退避：老片的种子可得性基本是静态的，把 3 次摊到几十天
 并不比连查 3 天多抓到什么；真要捞重新做种的片子得是月/年尺度的重扫，那靠订阅管理页的「重置全部
@@ -275,23 +289,23 @@ metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 
 「还要不要查」在写入时就落进了 `state`，调度器的候选集仍是一条纯 SQL：排除
 `exhausted` / `failed_terminal` / `running`，`failed_retryable` 看 `next_retry_at`——本任务退避
 为零、写入即到期，等价「下一轮照查」。「查过没找到」带 `error_code=no_candidate_found`，
-订阅页据此归入「未找到」档而非「查询失败」；索引器/提交故障声明不消耗查询次数
+订阅页据此归入「未找到」档而非「查询失败」；索引器/提交故障声明不消耗本轮没找到次数
 （`consumes_budget=False`），只落错误信息。本任务不使用 `extra` 列。
 
 状态取值：
 
 | state | 含义 |
 |---|---|
-| `pending` | 等待或本轮没找到资源，下轮继续 |
-| `succeeded` | 已提交下载。提交成功也照常记 `attempt_count`——次数的语义是「为这片花了几次搜索」 |
-| `failed` | 索引器调用出错。**不记 attempt_count、不动 last_attempted_at**：索引器故障是运维问题，不该消耗该影片的查询次数 |
-| `exhausted` | 老片查询次数用尽，只能由用户手动重置 |
+| `pending` | 从未查过（或重置后重开预算），等待下轮查询 |
+| `succeeded` | 已提交下载（或发现已有同样任务）。成功即收口本轮：`attempt_count` 清零，本轮没找到次数重新计；终身查过几次由 attempt 表行数体现 |
+| `failed` | 索引器调用出错。**回滚本轮计数（不消耗没找到次数），`last_attempted_at` 照常更新**：索引器故障是运维问题，不该消耗该影片的没找到次数 |
+| `exhausted` | 老片本轮没找到次数达到上限（默认 3），只能由用户手动重置 |
 
 **取消订阅不会删这些状态行，因此「未订阅 -> 订阅」的转变必须顺带重置它**（`MovieService` 的单条与
 批量订阅入口都做了）。否则一部曾被判 `exhausted` 的影片退订后重新订阅，状态行还是 `exhausted`，
 自动下载会直接跳过它，用户侧表现为「重新订阅了却完全没动静」。
 
-提交成功的种子后来判死时，该影片回到候选池并继续消耗次数，跑满同样会被放弃；此时用户能在订阅管理页
+提交成功的种子后来判死时，该影片回到候选池，新一轮没找到次数从 0 重新计，跑满同样会被放弃；此时用户能在订阅管理页
 看到失败的下载任务历史，据此决定要不要手动重置。
 
 ### 下载中种子小文件清理
@@ -353,11 +367,11 @@ metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 
 
 ### DownloadCandidate
 
-`DownloadCandidate` 表示一次 Jackett 搜索返回的候选资源，不落库。
+`DownloadCandidate` 表示一次 Torznab 搜索返回的候选资源，不落库。
 
 ```json
 {
-  "source": "jackett",
+  "source": "torznab",
   "indexer_name": "mteam",
   "indexer_kind": "pt",
   "resolved_client_id": 1,
@@ -437,6 +451,10 @@ metadata，生产实测 6 条冷门磁力在 120 秒内只换到 1 条（耗时 
 
 客户端先通过 `GET /download-tasks` 分页加载全部历史记录，再以 `GET /download-tasks/stream` 订阅 qBittorrent 的实时状态。两个接口都支持 `client_id` 与 `movie_number` 筛选；SSE 首次为每个匹配下载客户端发送 `snapshot`，随后发送：
 
+`GET /download-tasks` 还支持按下载状态筛选：`download_state` 可重复传多个取值（如
+`?download_state=downloading&download_state=stalled`），命中的是并集；未传或传空表示不过滤。
+取值集合与下文 `download_state` 枚举一致，非法取值返回 422。
+
 - `download_task_updated`：进度、速度、总大小、已下载量、ETA 与 qB 原始/归一化状态
 - `download_task_removed`：qB 中任务被移除或本系统删除任务
 - `download_client_status`：qB 客户端可用性，以及整体上下行速度
@@ -448,9 +466,19 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 
 - `POST /download-tasks/{task_id}/pause`
 - `POST /download-tasks/{task_id}/resume`
+- `GET /download-tasks/{task_id}/files`
 - `DELETE /download-tasks/{task_id}?delete_files=false&confirm_delete_files=false`
 
 `delete_files` 默认为 `false`。要连同 qB 下载文件删除，必须同时传 `delete_files=true` 和 `confirm_delete_files=true`；处于本地导入中的任务不能删除，避免与导入线程争用文件。删除成功后本地 `DownloadTask` 会被移除，已完成的媒体导入记录保持不变。
+
+`GET /download-tasks/{task_id}/files` 按任务实时拉取文件列表（不落库快照）：
+qBittorrent kind 走 qB Web API 并校验种子仍属于当前下载客户端；cloud115 kind 走
+115 SDK 递归列任务目录（`target_ref.cid`）。两种来源统一返回
+`{name, size, is_dir, path}` 结构，供下载任务页展示"这个任务里到底有哪些文件"——
+导入失败时（如只有 `.iso` 原盘）用户无需翻盘即可确认原因。任务在远端已不存在时
+返回 404（qB）/ `cloud115_download_task_source_unavailable`（115 目录已删），cookies
+失效等按 115 统一错误映射返回。cleanup-source 导入在没有失败项且有媒体产出（或没有可导入候选）
+时清理受管源目录；零产出但有跳过候选的目录会保留，供查看和重导。
 
 进度轮询周期：qBittorrent 由 `[downloads].progress_stream_poll_interval_seconds` 配置，默认 `1.0` 秒（允许 `0.2` 至 `10` 秒，修改后需重启 API）；cloud115 由 `[downloads].cloud115_progress_poll_interval_seconds` 配置，默认 `8.0` 秒（允许 `2` 至 `60` 秒，每轮现读、热生效）。Cloud115 SSE 始终从数据库构造完整快照，仅在存在 `queued/downloading` 任务时拉 115 离线列表补进度；没有活跃任务时零 115 请求。`abandoned` 任务仍保留在快照中，状态变化广播一次后不再请求远端进度。
 
@@ -511,6 +539,7 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 | `POST` | `/download-requests` | 向指定客户端提交下载 |
 | `GET` | `/download-tasks` | 分页查询全部下载历史 |
 | `GET` | `/download-tasks/stream` | 订阅 qBittorrent 实时进度 SSE |
+| `GET` | `/download-tasks/{task_id}/files` | 按任务实时拉取文件列表（qB / 115） |
 | `POST` | `/download-tasks/{task_id}/pause` | 暂停受管下载任务 |
 | `POST` | `/download-tasks/{task_id}/resume` | 恢复受管下载任务 |
 | `DELETE` | `/download-tasks/{task_id}` | 移除受管种子与本地任务镜像 |
@@ -974,7 +1003,7 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 
 ### Purpose
 
-根据番号搜索 Jackett 候选资源。
+根据番号搜索 Torznab 候选资源。
 
 ### Auth
 
@@ -988,7 +1017,7 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 ### Behavior
 
 - 服务读取 `/indexer-settings` 对应的当前运行时配置
-- 当 `movie_number` 以 `FC2` 开头（含 `FC2-PPV-xxxx`）时，调用 Jackett 会仅使用数字部分作为查询词
+- 当 `movie_number` 以 `FC2` 开头（含 `FC2-PPV-xxxx`）时，调用 Torznab 客户端会仅使用数字部分作为查询词
 - 结果为临时数据，不写入数据库
 - 每条候选通过 `download_clients` 返回对应索引器绑定的全部可选下载器，`resolved_client_*` 表示按全局偏好预选的默认下载器
 - 按“更高做种数优先，其次更大体积优先”排序返回
@@ -1002,7 +1031,7 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 ```json
 [
   {
-    "source": "jackett",
+    "source": "torznab",
     "indexer_name": "mteam",
     "indexer_kind": "pt",
     "resolved_client_id": 1,
@@ -1027,7 +1056,7 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 
 - `401 Unauthorized`: 未认证
 - `422 Unprocessable Entity`: 查询参数非法
-- `502 Bad Gateway`: Jackett 请求失败
+- `502 Bad Gateway`: Torznab 请求失败
 
 ### Endpoint
 
@@ -1047,7 +1076,7 @@ SSE 只服务在线实时展示，不把秒级进度写入数据库，也不改�
 {
   "movie_number": "ABC-001",
   "candidate": {
-    "source": "jackett",
+    "source": "torznab",
     "indexer_name": "mteam",
     "indexer_kind": "pt",
     "title": "ABC-001 4K 中文字幕",

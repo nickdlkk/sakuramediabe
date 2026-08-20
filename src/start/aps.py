@@ -27,8 +27,10 @@ from src.start.recovery import recover_interrupted_tasks
 INTERRUPTED_TASK_RUN_ERROR_MESSAGE = "任务执行中断，等待重试"
 
 
-def get_job_cron_setting(job_def: JobDefinition) -> str:
+def get_job_cron_setting(job_def: JobDefinition) -> str | None:
     """返回对外展示的 cron 配置路径。"""
+    if job_def.manual_only:
+        return None
     if job_def.plugin_id is not None:
         return f"plugins.job_crons.{job_def.plugin_id}.{job_def.task_key}"
     if job_def.cron_setting is None:
@@ -36,8 +38,10 @@ def get_job_cron_setting(job_def: JobDefinition) -> str:
     return job_def.cron_setting
 
 
-def resolve_job_cron_expr(job_def: JobDefinition) -> str:
+def resolve_job_cron_expr(job_def: JobDefinition) -> str | None:
     """解析内建任务静态配置或插件任务显式覆盖后的 cron。"""
+    if job_def.manual_only:
+        return None
     if job_def.plugin_id is not None:
         cron_expr = (
             settings.plugins.job_crons
@@ -61,7 +65,10 @@ def resolve_job_cron_expr(job_def: JobDefinition) -> str:
     return getattr(Scheduler(), job_def.cron_setting)
 
 
-def _prepare_recovery(job_def: JobDefinition) -> tuple[Callable[..., Any], dict[str, int], int]:
+def _prepare_recovery(
+    job_def: JobDefinition,
+    params: dict[str, Any] | None = None,
+) -> tuple[Callable[..., Any], dict[str, int], int]:
     """统一执行 stale task_run 回收，并把回收统计折叠进任务结果。"""
     recovered_task_runs = ActivityService.recover_interrupted_task_runs(
         task_key=job_def.task_key,
@@ -74,7 +81,12 @@ def _prepare_recovery(job_def: JobDefinition) -> tuple[Callable[..., Any], dict[
     if recovered_task_runs and job_def.business_recovery:
         recovery_stats.update(job_def.business_recovery())
 
-    func = job_def.service_factory
+    if params and job_def.params_handler is not None:
+        func: Callable[..., Any] = lambda reporter: job_def.params_handler(reporter, params)
+    elif job_def.service_factory is not None:
+        func = job_def.service_factory
+    else:
+        raise RuntimeError(f"任务缺少执行体 task_key={job_def.task_key}")
     if recovered_task_runs:
         original_func = func
 
@@ -95,12 +107,13 @@ def run_job(
     *,
     trigger_type: str = "scheduled",
     extra_callbacks: list[Callable[[dict[str, Any]], None]] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> Any:
     """通用任务执行入口，供 APS 定时触发和 CLI 手动触发共用。"""
     ensure_database_ready()
 
     # 统一先回收当前 task_key 遗留的 task_run，确保 stale mutex 不会卡死后续调度。
-    func, _recovery_stats, _recovered_count = _prepare_recovery(job_def)
+    func, _recovery_stats, _recovered_count = _prepare_recovery(job_def, params=params)
 
     conflict_policy = "raise" if trigger_type == "manual" else "skip"
     result = ActivityService.run_task(
@@ -147,7 +160,10 @@ def enqueue_scheduled_job(job_def: JobDefinition) -> BackgroundTaskRun | None:
     return task_run
 
 
-def submit_manual_job(job_def: JobDefinition) -> BackgroundTaskRun:
+def submit_manual_job(
+    job_def: JobDefinition,
+    params: dict[str, Any] | None = None,
+) -> BackgroundTaskRun:
     """手动触发入队（202 语义），由 worker 进程领取执行，返回新建的 task_run。
 
     不再在当前进程起 daemon 线程执行——Web 进程只写队列，长任务不占请求线程。
@@ -158,6 +174,7 @@ def submit_manual_job(job_def: JobDefinition) -> BackgroundTaskRun:
         return TaskQueueService.enqueue(
             task_key=job_def.task_key,
             trigger_type="manual",
+            params=params,
             conflict="raise",
         )
     except TaskQueueConflictError as exc:
@@ -213,33 +230,6 @@ def _schedule_bootstrap_job(
         replace_existing=True,
         misfire_grace_time=None,
     )
-
-
-def _bootstrap_first_playback_ranking(scheduler: BlockingScheduler) -> None:
-    """首次部署引导：若 Movie 表为空，安排一次 javdb 热播榜 daily 抓取。
-
-    - 目的：新库启动后立刻有内容，不必等凌晨 01:45 的定时 ranking_sync
-    - 目标最小：只抓 javdb 免登录的 playback_all/daily，冷启动足够轻
-    - 任何异常都吞掉：早期部署可能还没跑迁移，不能让引导逻辑打崩 APS 启动
-    """
-    try:
-        from src.model.catalog.movies import Movie
-        from src.service.discovery import RankingSyncService
-
-        if Movie.select().count() > 0:
-            return
-
-        logger.info("首次部署检测：影片库为空，安排一次 javdb 热播榜（daily）抓取")
-        _schedule_bootstrap_job(
-            scheduler,
-            "ranking_sync",
-            job_id="bootstrap_ranking_playback",
-            func=lambda _reporter: RankingSyncService().sync_board_period(
-                "javdb", "playback_all", "daily"
-            ),
-        )
-    except Exception:
-        logger.exception("Skip bootstrap ranking due to unexpected error")
 
 
 def _bootstrap_gfriends_filetree_refresh(scheduler: BlockingScheduler) -> None:
@@ -306,6 +296,8 @@ def build_scheduler() -> BlockingScheduler:
         timezone=timezone,
     )
     for job_def in JOB_REGISTRY:
+        if job_def.manual_only:
+            continue
         cron_expr = resolve_job_cron_expr(job_def)
         # cron 触发只入队（enqueue_scheduled_job），实际执行在 TaskWorker；
         # 入队秒级完成，APS 线程池不再被长任务占用。
@@ -326,13 +318,11 @@ def aps():
     database = ensure_database_ready()
     logger.info("Scheduler runtime database ready {}", type(database).__name__)
     # APS 进程启动时统一回收由该进程负责的任务类型，并联动清理业务侧 running 状态。
-    # startup 类型对应本进程内 `_bootstrap_first_playback_ranking` 排下的引导任务。
     recover_interrupted_tasks(
         trigger_types=("scheduled", "manual", "internal", "startup"),
         error_message="APS进程重启，任务已中断",
     )
     scheduler = build_scheduler()
-    _bootstrap_first_playback_ranking(scheduler)
     _bootstrap_gfriends_filetree_refresh(scheduler)
     _bootstrap_movie_similarity_index(scheduler)
     # 队列 worker 与调度器同进程：APS 只按 cron 入队，worker 领取执行。
@@ -341,6 +331,7 @@ def aps():
     cron_info = " ".join(
         f"{get_job_cron_setting(j)}={resolve_job_cron_expr(j)}"
         for j in JOB_REGISTRY
+        if not j.manual_only
     )
     logger.info("Starting scheduler runtime_timezone={} {}", get_runtime_timezone_name(), cron_info)
     scheduler.start()

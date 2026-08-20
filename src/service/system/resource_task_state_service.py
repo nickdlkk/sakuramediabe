@@ -43,6 +43,7 @@ class ResourceTaskDefinition:
     supported_actions: tuple[str, ...] = SUPPORTED_ACTIONS
     # 领域合格性钩子：action 入口先跑它过滤领域上不成立的资源（影片缺字段 / 媒体失效等）。
     check_actionable: Callable[[list[int]], dict[int, str]] | None = None
+    deferred_limit: int = 0
 
 
 @dataclass(frozen=True)
@@ -77,14 +78,6 @@ class ResourceTaskStateService:
         "updated_at:asc": (ResourceTaskState.updated_at.asc(), ResourceTaskState.id.asc()),
     }
     TASK_REGISTRY = {
-        "movie_desc_sync": ResourceTaskDefinition(
-            task_key="movie_desc_sync",
-            resource_type="movie",
-            display_name="影片描述回填",
-            default_sort="last_attempted_at:desc",
-            resource_resolver=MOVIE_TASK_RECORD_RESOLVER,
-            check_actionable=build_movie_actionable_check(),
-        ),
         "movie_interaction_sync": ResourceTaskDefinition(
             task_key="movie_interaction_sync",
             resource_type="movie",
@@ -96,28 +89,6 @@ class ResourceTaskStateService:
                 missing_reason="movie_javdb_id_missing",
             ),
         ),
-        "movie_desc_translation": ResourceTaskDefinition(
-            task_key="movie_desc_translation",
-            resource_type="movie",
-            display_name="影片简介翻译",
-            default_sort="last_attempted_at:desc",
-            resource_resolver=MOVIE_TASK_RECORD_RESOLVER,
-            check_actionable=build_movie_actionable_check(
-                required_attr="desc",
-                missing_reason="movie_desc_missing",
-            ),
-        ),
-        "movie_title_translation": ResourceTaskDefinition(
-            task_key="movie_title_translation",
-            resource_type="movie",
-            display_name="影片标题翻译",
-            default_sort="last_attempted_at:desc",
-            resource_resolver=MOVIE_TASK_RECORD_RESOLVER,
-            check_actionable=build_movie_actionable_check(
-                required_attr="title",
-                missing_reason="movie_title_missing",
-            ),
-        ),
         "media_thumbnail_generation": ResourceTaskDefinition(
             task_key="media_thumbnail_generation",
             resource_type="media",
@@ -127,6 +98,7 @@ class ResourceTaskStateService:
             # 不开放 rerun：缩略图不支持覆盖再生（已存在即跳过），rerun 只会空转。
             supported_actions=(ACTION_RETRY_NOW, ACTION_RESET_RETRY_BUDGET),
             check_actionable=media_actionable_check,
+            deferred_limit=5,
         ),
         # Wave 2：task_key 与 job 合并（原 subscribed_movie_search，历史行随迁移清空）。
         "subscribed_movie_auto_download": ResourceTaskDefinition(
@@ -374,6 +346,15 @@ class ResourceTaskStateService:
             resource_summaries = task_definition.resource_resolver.resolve_summaries(
                 [record.resource_id for record in records]
             )
+        def deferred_metadata(record: ResourceTaskState) -> tuple[int, str | None]:
+            if not isinstance(record.extra, dict):
+                return 0, None
+            count = record.extra.get("deferred_count")
+            reason = record.extra.get("deferred_reason")
+            return (
+                count if isinstance(count, int) and count > 0 else 0,
+                reason if isinstance(reason, str) and reason.strip() else None,
+            )
         return PageResponse[ResourceTaskRecordResource](
             items=[
                 ResourceTaskRecordResource(
@@ -382,6 +363,10 @@ class ResourceTaskStateService:
                     resource_id=record.resource_id,
                     state=record.state,
                     attempt_count=record.attempt_count,
+                    deferred_count=deferred_metadata(record)[0],
+                    deferred_limit=task_definition.deferred_limit,
+                    deferred_reason=deferred_metadata(record)[1],
+                    next_retry_at=record.next_retry_at,
                     last_attempted_at=record.last_attempted_at,
                     last_succeeded_at=record.last_succeeded_at,
                     last_error=record.last_error,
@@ -416,12 +401,19 @@ class ResourceTaskStateService:
         resource_summary = None
         if task_definition.resource_resolver is not None:
             resource_summary = task_definition.resource_resolver.resolve_summaries([int(resource_id)]).get(int(resource_id))
+        extra = record.extra if isinstance(record.extra, dict) else {}
+        deferred_count = extra.get("deferred_count")
+        deferred_reason = extra.get("deferred_reason")
         return ResourceTaskRecordResource(
             task_key=record.task_key,
             resource_type=record.resource_type,
             resource_id=record.resource_id,
             state=record.state,
             attempt_count=record.attempt_count,
+            deferred_count=deferred_count if isinstance(deferred_count, int) and deferred_count > 0 else 0,
+            deferred_limit=task_definition.deferred_limit,
+            deferred_reason=deferred_reason if isinstance(deferred_reason, str) and deferred_reason.strip() else None,
+            next_retry_at=record.next_retry_at,
             last_attempted_at=record.last_attempted_at,
             last_succeeded_at=record.last_succeeded_at,
             last_error=record.last_error,
