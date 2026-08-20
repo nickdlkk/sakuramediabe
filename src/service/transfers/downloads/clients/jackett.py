@@ -187,9 +187,10 @@ class JackettClient:
         # 转载/镜像后的 torrent 元数据（例如 created by/comment 指向其他站点），而同一条目里的
         # guid 往往仍是原站直链。这里按内容与来源共同判定：
         #   1. magnet 仍优先归 magnet_url
-        #   2. 非磁力链接里，优先选择“不是本地 Jackett /dl/ 代理且以 .torrent 结尾”的直链
-        #   3. 若没有直链，再回退到第一个非磁力链接（通常是 Jackett /dl/ 代理）
+        #   2. 非磁力链接里，优先 Jackett /dl/ 代理（同机可直接取回、可绕开上游 challenge）
+        #   3. 没有 /dl/ 时，再回退到上游 .torrent 直链或第一个非磁力链接
         magnet_url = ""
+        jackett_proxy_torrent_url = ""
         direct_torrent_url = ""
         fallback_torrent_url = ""
         for raw in raw_links:
@@ -202,9 +203,12 @@ class JackettClient:
                 continue
             if not fallback_torrent_url:
                 fallback_torrent_url = link
-            if lower.endswith('.torrent') and '/dl/' not in lower:
+            if '/dl/' in lower:
+                jackett_proxy_torrent_url = jackett_proxy_torrent_url or link
+                continue
+            if lower.endswith('.torrent'):
                 direct_torrent_url = direct_torrent_url or link
-        return magnet_url, (direct_torrent_url or fallback_torrent_url)
+        return magnet_url, (jackett_proxy_torrent_url or direct_torrent_url or fallback_torrent_url)
 
 
     @staticmethod
