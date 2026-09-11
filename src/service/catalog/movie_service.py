@@ -75,6 +75,7 @@ from src.schema.catalog.movies import (
 from src.schema.common.pagination import PageResponse
 from src.service.catalog.movie_list_media_service import attach_movie_list_media
 from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
+from src.service.catalog.movie_resolution_service import resolution_exists_expression
 from src.service.collections import PlaylistService
 from src.service.playback.provider_helpers import library_handle_for, media_handle_for
 
@@ -115,6 +116,7 @@ class MovieService:
         number_source: MovieNumberSource = MovieNumberSource.ALL,
         heat_min: int | None = None,
         heat_max: int | None = None,
+        resolution: str | None = None,
         blacklisted: bool = False,
     ):
         """构建影片列表的基础筛选链路，供列表和计数查询复用。"""
@@ -180,6 +182,10 @@ class MovieService:
             filtered_query = filtered_query.where(Movie.heat >= heat_min)
         if heat_max is not None:
             filtered_query = filtered_query.where(Movie.heat <= heat_max)
+        if resolution is not None:
+            filtered_query = filtered_query.where(
+                resolution_exists_expression(resolution, error_code="invalid_movie_filter")
+            )
         return filtered_query
 
     @staticmethod
@@ -226,6 +232,7 @@ class MovieService:
         number_source: MovieNumberSource = MovieNumberSource.ALL,
         heat_min: int | None = None,
         heat_max: int | None = None,
+        resolution: str | None = None,
         blacklisted: bool = False,
     ):
         """列表查询统一在这里补齐封面图和 ``can_play`` 计算列。"""
@@ -244,6 +251,7 @@ class MovieService:
                 number_source=number_source,
                 heat_min=heat_min,
                 heat_max=heat_max,
+                resolution=resolution,
                 blacklisted=blacklisted,
             ).select(Movie, can_play_expression)
         )
@@ -555,6 +563,7 @@ class MovieService:
         maker_name: str | None = None,
         heat_min: int | None = None,
         heat_max: int | None = None,
+        resolution: str | None = None,
         blacklisted: bool = False,
         page: int = 1,
         page_size: int = 20,
@@ -572,6 +581,7 @@ class MovieService:
             number_source=number_source,
             heat_min=heat_min,
             heat_max=heat_max,
+            resolution=resolution,
             blacklisted=blacklisted,
         ).count()
         movies = list(
@@ -588,6 +598,7 @@ class MovieService:
                 number_source=number_source,
                 heat_min=heat_min,
                 heat_max=heat_max,
+                resolution=resolution,
                 blacklisted=blacklisted,
             ).offset(start).limit(page_size)
         )

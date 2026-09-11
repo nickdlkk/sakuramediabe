@@ -223,3 +223,31 @@ def test_movie_list_api_serializes_media(client, account_user, media_movies):
         response = client.get(path, headers=headers)
         assert response.status_code == 200
         _assert_media_payload(response.json()["items"], media_movies)
+
+@pytest.mark.parametrize("resolution, expected", [
+    ("4K", ["RES-0", "RES-3"]), ("1080P", ["RES-1"]), ("8K", ["RES-2"]),
+])
+def test_movie_and_playlist_resolution_use_highest_valid_media(test_db, resolution, expected):
+    library = MediaLibrary.create(name="Resolution", provider_key="not-installed")
+    playlist = Playlist.create(name="Resolution")
+    for index, values in enumerate([
+        ["1920x1080", "3840x2160"], ["1920x1080"], ["3840x2160", "7680x4320"],
+        ["3840x2160"], [None], ["unknown"], [],
+    ]):
+        movie = Movie.create(movie_number=f"RES-{index}", javdb_id=f"res-{index}", title="Resolution")
+        PlaylistMovie.create(playlist=playlist, movie=movie)
+        for i, value in enumerate(values):
+            Media.create(movie=movie, library=library, file_name=f"{index}-{i}.mp4", resolution=value)
+    Media.create(movie="RES-1", library=library, file_name="invalid.mp4", resolution="7680x4320", valid=False)
+    for list_movies in [
+        partial(MovieService.list_movies, sort="release_date:asc"),
+        partial(PlaylistService.list_playlist_movies, playlist.id, sort="release_date:asc"),
+    ]:
+        result = list_movies(resolution=resolution, page_size=1)
+        assert result.total == len(expected)
+        numbers = [result.items[0].movie_number]
+        for page in range(2, len(expected) + 1):
+            numbers.extend(item.movie_number for item in list_movies(resolution=resolution, page=page, page_size=1).items)
+        assert sorted(numbers) == expected
+    options = PlaylistService.list_playlist_resolutions(playlist.id)
+    assert {option.resolution: option.count for option in options} == {"4K": 2, "1080P": 1, "8K": 1}
