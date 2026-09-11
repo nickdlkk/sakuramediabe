@@ -42,8 +42,8 @@ from src.service.catalog.movie_list_media_service import attach_movie_list_media
 from src.service.catalog.movie_resolution_service import (
     RESOLUTION_LEVELS,
     resolution_exists_expression,
-    resolution_height_expression,
     resolution_interval,
+    resolution_level_expression,
 )
 
 # 系统列表内部展示次序：最近播放在前，自定义列表在后。
@@ -340,12 +340,12 @@ class PlaylistService:
         )
 
     @staticmethod
-    def _bucket_for_height(height: int | None) -> str | None:
-        """按高度把影片归入最高命中档位；无法解析的取 None 不计入。"""
-        if height is None:
+    def _bucket_for_level(level: int | None) -> str | None:
+        """按序号把影片归入最高命中档位；无法解析的取 None 不计入。"""
+        if level is None:
             return None
         for label, threshold in RESOLUTION_LEVELS:
-            if height >= threshold:
+            if level >= threshold:
                 return label
         return None
 
@@ -361,17 +361,17 @@ class PlaylistService:
             .join(PlaylistMovie, on=(PlaylistMovie.movie == Movie.id))
             .where(PlaylistMovie.playlist == playlist)
         )
-        max_height = fn.MAX(resolution_height_expression())
-        # SQL 层只按影片聚合最高 height，分桶落在 Python，避免聚合函数进 GROUP BY。
+        max_level = fn.MAX(resolution_level_expression())
+        # SQL 层只按影片聚合最高档位序号，分桶落在 Python，避免聚合函数进 GROUP BY。
         query = (
-            base.select(Movie.id, max_height.alias("max_height"))
+            base.select(Movie.id, max_level.alias("max_level"))
             .join(Media, on=(Media.movie == Movie.movie_number))
             .where(Media.valid == True, Media.resolution.regexp(r"^\d+x\d+$"))
             .group_by(Movie.id)
         )
         counts: dict[str, int] = {}
         for row in query:
-            label = cls._bucket_for_height(row.max_height)
+            label = cls._bucket_for_level(row.max_level)
             if label is not None:
                 counts[label] = counts.get(label, 0) + 1
         options: list[PlaylistResolutionOption] = []

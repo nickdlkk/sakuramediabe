@@ -251,3 +251,36 @@ def test_movie_and_playlist_resolution_use_highest_valid_media(test_db, resoluti
         assert sorted(numbers) == expected
     options = PlaylistService.list_playlist_resolutions(playlist.id)
     assert {option.resolution: option.count for option in options} == {"4K": 2, "1080P": 1, "8K": 1}
+
+
+@pytest.mark.parametrize("values, expected", [
+    (["8192x4096"], "8K"),
+    (["7680x3840"], "8K"),
+    (["7679x4320"], "4K"),
+    (["4096x1716"], "4K"),
+    (["4096x2048"], "4K"),
+    (["3840x1920"], "4K"),
+    (["3840x1600"], "4K"),
+    (["3839x2160"], "2K"),
+    (["2560x1440"], "2K"),
+    (["1920x1080"], "1080P"),
+    (["1280x720"], "720P"),
+    (["854x480"], "480P"),
+    (["640x360"], "360P"),
+    (["7680x3840", "4096x4096"], "8K"),
+    (["0x4320", "8192x0", "bad"], None),
+])
+def test_resolution_width_tiers_match_filters_and_playlist_options(test_db, values, expected):
+    library = MediaLibrary.create(name="Width tiers", provider_key="not-installed")
+    playlist = Playlist.create(name="Width tiers")
+    movie = Movie.create(movie_number="WIDTH-1", javdb_id="width-1", title="Width tiers")
+    PlaylistMovie.create(playlist=playlist, movie=movie)
+    for index, value in enumerate(values):
+        Media.create(movie=movie, library=library, file_name=f"{index}.mp4", resolution=value)
+    Media.create(movie=movie, library=library, file_name="invalid.mp4", resolution="15360x8640", valid=False)
+    for resolution in ["8K", "4K", "2K", "1080P", "720P", "480P", "360P"]:
+        for list_movies in [MovieService.list_movies, partial(PlaylistService.list_playlist_movies, playlist.id)]:
+            result = list_movies(resolution=resolution)
+            assert [item.movie_number for item in result.items] == (["WIDTH-1"] if resolution == expected else [])
+    options = PlaylistService.list_playlist_resolutions(playlist.id)
+    assert {option.resolution: option.count for option in options} == ({expected: 1} if expected else {})
