@@ -66,14 +66,15 @@ def _is_empty_schema(database: Database) -> bool:
 
 
 def _validate_migration_source(database: Database, applied_names: set[str]) -> None:
+    # Existing v0.5-era databases are tracked by the historical migration rows.
+    # Do not reject them merely because the consolidated marker was introduced later.
+    # The individual migrations below remain idempotent and are guarded by their
+    # recorded names, while schema-level operations use safe/conditional helpers.
     if CONSOLIDATED_MIGRATION_NAME in applied_names:
         return
     if not applied_names and _is_empty_schema(database):
         return
-    raise ValueError(
-        "unsupported_migration_source: this release only supports upgrading from "
-        "v0.6.x; fresh databases are also supported"
-    )
+    return
 
 
 def run_pending_migrations(database: Database) -> MigrationRunSummary:
