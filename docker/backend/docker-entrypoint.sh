@@ -44,12 +44,9 @@ chown_if_mismatch() {
 }
 
 bootstrap_data_dirs() {
-    # cache/subtitles 是 legacy 目录：字幕已统一到 cache/assets/movies/<shard>/<番号>/subtitles/。
-    # 这里仍然建目录并归属，是因为 migrate-movie-subtitles CLI 迁移后要 unlink 旧目录里已搬走的字幕文件，需要写权限。
     mkdir -p \
         "${DATA_ROOT}/config" \
         "${DATA_ROOT}/cache/assets" \
-        "${DATA_ROOT}/cache/subtitles" \
         "${DATA_ROOT}/cache/gfriends" \
         "${DATA_ROOT}/media-clips" \
         "${DATA_ROOT}/plugins" \
@@ -65,7 +62,6 @@ bootstrap_data_dirs() {
         "${DATA_ROOT}/config" \
         "${DATA_ROOT}/cache" \
         "${DATA_ROOT}/cache/assets" \
-        "${DATA_ROOT}/cache/subtitles" \
         "${DATA_ROOT}/cache/gfriends" \
         "${DATA_ROOT}/media-clips" \
         "${DATA_ROOT}/plugins" \
@@ -92,14 +88,28 @@ bootstrap_default_data() {
     su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands initdb" "${APP_USER}"
 }
 
+sync_plugin_dependencies() {
+    echo "Syncing plugin dependencies..."
+    # 必须在 supervisor 启动 api/aps 前串行执行：两者都会在 import 期加载插件。
+    # 单个插件失败由命令落盘并由加载器隔离，命令本身保持成功以便服务继续启动。
+    su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands plugins sync-dependencies" "${APP_USER}"
+}
+
+validate_plugin_installation() {
+    echo "Validating plugin installation..."
+    su -s /bin/bash -c "cd \"${APP_ROOT}\" && PYTHONPATH=\"${APP_ROOT}\" \"${PYTHON_BIN}\" -m src.start.commands plugins validate-installation" "${APP_USER}"
+}
+
 if [ "${1:-}" = "start" ]; then
     ensure_app_identity
     bootstrap_data_dirs
     wait_for_database
     run_database_migrations
     bootstrap_default_data
+    sync_plugin_dependencies
+    validate_plugin_installation
 
-    # 主服务只负责 API 和任务编排，不再处理 JoyTag 推理设备映射。
+    # 主服务只负责 API 和任务编排，不处理嵌入推理设备映射。
     id "${APP_USER}" || true
 
     echo "Starting supervisor..."

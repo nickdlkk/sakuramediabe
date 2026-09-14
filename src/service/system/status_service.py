@@ -1,4 +1,3 @@
-import asyncio
 import os
 import time
 
@@ -6,20 +5,23 @@ from peewee import fn
 
 from src.common.runtime_time import utc_now_for_db
 from src.config.config import settings
-from src.lib.cloud115 import Cloud115AuthError, Cloud115CookieStatus
 from src.metadata.factory import build_javdb_provider
 from src.metadata.provider import MetadataNotFoundError, MetadataRequestError
-from src.model import Actor, Media, MediaLibrary, MediaThumbnail, Movie
-from src.model.enums import MediaLibraryBackend
+from src.model import (
+    Actor,
+    BackgroundTaskRun,
+    Media,
+    MediaLibrary,
+    MediaThumbnail,
+    Movie,
+)
 from src.schema.system.status import (
     StatusActorSummary,
-    StatusCloud115CookiesResource,
-    StatusCloud115CookieSummary,
-    StatusCloud115LibraryCookieResource,
+    StatusEmbeddingServiceSummary,
     StatusImageSearchIndexingSummary,
+    StatusImageSearchIndexSpaceSummary,
     StatusImageSearchResource,
     StatusImageSearchVectorStoreSummary,
-    StatusJoyTagSummary,
     StatusMediaFileSummary,
     StatusMediaLibrarySummary,
     StatusMetadataProviderTestError,
@@ -28,12 +30,17 @@ from src.schema.system.status import (
     StatusResource,
     StatusThumbnailSummary,
 )
-from src.service.cloud115 import Cloud115KeepaliveService
-from src.service.discovery.joytag_embedder_client import (
-    JoyTagInferenceClientError,
-    get_joytag_embedder_client,
+from src.service.discovery.embedding_client import (
+    EmbeddingClientError,
+    get_embedding_client,
 )
-from src.service.discovery.qdrant_thumbnail_store import get_qdrant_thumbnail_store
+from src.service.discovery.image_search_index_space_service import (
+    ImageSearchIndexSpaceService,
+)
+from src.service.discovery.qdrant_thumbnail_store import (
+    QdrantThumbnailStore,
+    get_qdrant_thumbnail_store,
+)
 from src.service.playback.media_thumbnail_service import MediaThumbnailService
 
 
@@ -70,6 +77,8 @@ class StatusService:
 
         # 待生成缩略图的媒体文件数复用缩略图服务的判定口径；缩略图文件数即 MediaThumbnail 行数（与 Media 一对多）。
         pending_thumbnail_media = MediaThumbnailService.count_pending_media()
+        retry_wait_thumbnail_media = MediaThumbnailService.count_retry_wait_media()
+        terminal_thumbnail_media = MediaThumbnailService.count_terminal_failed_media()
         thumbnail_total = MediaThumbnail.select().count()
 
         return StatusResource(
@@ -90,54 +99,10 @@ class StatusService:
             media_libraries=StatusMediaLibrarySummary(total=int(media_library_total)),
             thumbnails=StatusThumbnailSummary(
                 pending_media=int(pending_thumbnail_media),
+                retry_wait_media=int(retry_wait_thumbnail_media),
+                terminal_failed_media=int(terminal_thumbnail_media),
                 total=int(thumbnail_total),
             ),
-        )
-
-    @classmethod
-    async def get_cloud115_cookies_status(cls) -> StatusCloud115CookiesResource:
-        """并发探测所有 cloud115 库，返回逐库状态与本轮汇总。"""
-        libraries = list(
-            MediaLibrary.select()
-            .where(MediaLibrary.backend == MediaLibraryBackend.CLOUD115.value)
-            .order_by(MediaLibrary.id)
-        )
-        items = await asyncio.gather(
-            *(cls._probe_cloud115_library(library) for library in libraries)
-        )
-        counts = {
-            status: sum(item.cookie_status is status for item in items)
-            for status in Cloud115CookieStatus
-        }
-        return StatusCloud115CookiesResource(
-            checked_at=utc_now_for_db(),
-            summary=StatusCloud115CookieSummary(
-                total=len(items),
-                alive=counts[Cloud115CookieStatus.ALIVE],
-                expired=counts[Cloud115CookieStatus.EXPIRED],
-                unavailable=counts[Cloud115CookieStatus.UNAVAILABLE],
-            ),
-            libraries=items,
-        )
-
-    @staticmethod
-    async def _probe_cloud115_library(
-        library: MediaLibrary,
-    ) -> StatusCloud115LibraryCookieResource:
-        """隔离单库探测异常，避免一个账号阻断整个集合响应。"""
-        try:
-            cookie_status = await Cloud115KeepaliveService.probe_library_cookies_status(
-                library
-            )
-        except Cloud115AuthError:
-            cookie_status = Cloud115CookieStatus.EXPIRED
-        except Exception:
-            # 单库异常不能中断整个集合响应；上游/本地瞬时故障统一视为暂不可用。
-            cookie_status = Cloud115CookieStatus.UNAVAILABLE
-        return StatusCloud115LibraryCookieResource(
-            library_id=library.id,
-            name=library.name,
-            cookie_status=cookie_status,
         )
 
     @classmethod
@@ -150,15 +115,24 @@ class StatusService:
 
     @classmethod
     def get_image_search_status(cls) -> StatusImageSearchResource:
-        joytag = cls._probe_joytag()
+        embedding_service = cls._probe_embedding_service()
         image_search_vector_store = cls._probe_image_search_vector_store()
         indexing = cls._indexing_status()
+        index_space = ImageSearchIndexSpaceService.get_status(
+            embedding_service.space_id if embedding_service.healthy else None
+        )
         return StatusImageSearchResource(
-            healthy=bool(joytag.healthy and image_search_vector_store.healthy),
+            healthy=bool(embedding_service.healthy and image_search_vector_store.healthy),
             checked_at=utc_now_for_db(),
-            joytag=joytag,
+            embedding_service=embedding_service,
             image_search_vector_store=image_search_vector_store,
             indexing=indexing,
+            index_space=StatusImageSearchIndexSpaceSummary(
+                state=index_space.state,
+                indexed_space_id=index_space.indexed_space_id,
+                current_space_id=index_space.current_space_id,
+                is_rebuilding=cls._is_image_search_rebuilding(),
+            ),
         )
 
     @classmethod
@@ -241,34 +215,27 @@ class StatusService:
         return int((time.time() - start_at) * 1000)
 
     @classmethod
-    def _probe_joytag(cls) -> StatusJoyTagSummary:
+    def _probe_embedding_service(cls) -> StatusEmbeddingServiceSummary:
         try:
-            runtime = get_joytag_embedder_client().get_runtime_status()
-        except JoyTagInferenceClientError as exc:
-            return StatusJoyTagSummary(
+            space = get_embedding_client().describe()
+        except EmbeddingClientError as exc:
+            return StatusEmbeddingServiceSummary(
                 healthy=False,
                 endpoint=str(settings.image_search.inference_base_url),
                 error=exc.message,
             )
         except Exception as exc:
-            return StatusJoyTagSummary(
+            return StatusEmbeddingServiceSummary(
                 healthy=False,
                 endpoint=str(settings.image_search.inference_base_url),
                 error=str(exc),
             )
-        return StatusJoyTagSummary(
+        return StatusEmbeddingServiceSummary(
             healthy=True,
-            endpoint=runtime.endpoint,
-            backend=runtime.backend,
-            execution_provider=runtime.execution_provider,
-            used_device=runtime.device,
-            available_devices=[str(item) for item in list(runtime.available_providers or [])],
-            device_full_name=runtime.device_full_name,
-            model_file=runtime.model_path,
-            model_name=runtime.model_name,
-            vector_size=runtime.vector_size,
-            image_size=runtime.image_size,
-            probe_latency_ms=runtime.probe_latency_ms,
+            endpoint=str(settings.image_search.inference_base_url),
+            space_id=space.space_id,
+            dimension=space.dimension,
+            modalities=sorted(space.modalities),
         )
 
     @staticmethod
@@ -293,7 +260,7 @@ class StatusService:
             return StatusImageSearchVectorStoreSummary(
                 healthy=False,
                 url=str(settings.qdrant.url),
-                collection_name="media_thumbnail_vectors",
+                collection_name=QdrantThumbnailStore.COLLECTION_NAME,
                 exists=False,
                 error=str(exc),
             )
@@ -302,21 +269,27 @@ class StatusService:
     def _indexing_status() -> StatusImageSearchIndexingSummary:
         pending = (
             MediaThumbnail.select()
-            .where(MediaThumbnail.joytag_index_status == MediaThumbnail.JOYTAG_INDEX_STATUS_PENDING)
+            .where(MediaThumbnail.image_search_index_status == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_PENDING)
             .count()
         )
         failed = (
             MediaThumbnail.select()
-            .where(MediaThumbnail.joytag_index_status == MediaThumbnail.JOYTAG_INDEX_STATUS_FAILED)
-            .count()
-        )
-        success = (
-            MediaThumbnail.select()
-            .where(MediaThumbnail.joytag_index_status == MediaThumbnail.JOYTAG_INDEX_STATUS_SUCCESS)
+            .where(MediaThumbnail.image_search_index_status == MediaThumbnail.IMAGE_SEARCH_INDEX_STATUS_FAILED)
             .count()
         )
         return StatusImageSearchIndexingSummary(
             pending_thumbnails=int(pending),
             failed_thumbnails=int(failed),
-            success_thumbnails=int(success),
         )
+
+    @staticmethod
+    def _is_image_search_rebuilding() -> bool:
+        task_run = (
+            BackgroundTaskRun.select(BackgroundTaskRun.params)
+            .where(
+                BackgroundTaskRun.task_key == "image_search_index",
+                BackgroundTaskRun.state.in_(("pending", "running")),
+            )
+            .first()
+        )
+        return task_run is not None and (task_run.params or {}).get("reset") is True

@@ -1,3 +1,4 @@
+import time
 from collections.abc import Sequence
 from functools import lru_cache
 from typing import Any
@@ -9,9 +10,11 @@ from src.config.config import settings
 
 try:
     from qdrant_client import QdrantClient, models
+    from qdrant_client.http.exceptions import ResponseHandlingException
 except ImportError:  # pragma: no cover - exercised when dependency is missing at runtime.
     QdrantClient = None
     models = None
+    ResponseHandlingException = ()
 
 
 class ThumbnailVectorRecord(BaseModel):
@@ -31,9 +34,12 @@ class ThumbnailVectorSearchHit(BaseModel):
 
 
 class QdrantThumbnailStore:
-    COLLECTION_NAME = "media_thumbnail_vectors"
+    # v0.5.3 的同名集合保存 JoyTag 向量；换名可避免把旧向量误当成 SigLIP2 数据复用。
+    COLLECTION_NAME = "media_thumbnail_vectors_siglip2_v1"
     PAYLOAD_INDEX_FIELDS = ("movie_id", "media_id")
     CLIENT_TIMEOUT_SECONDS = 30
+    CLEAR_TIMEOUT_SECONDS = 300
+    UPSERT_RETRY_DELAYS_SECONDS = (3, 10, 20, 60, 60)
     HNSW_M = 16
     HNSW_EF_CONSTRUCT = 128
     HNSW_EF_SEARCH = 128
@@ -54,24 +60,59 @@ class QdrantThumbnailStore:
         self.collection_name = self.COLLECTION_NAME
         self.api_key = api_key if api_key is not None else settings.qdrant.api_key
         self._client = client
+        self._client_was_injected = client is not None
 
     @staticmethod
     def _ensure_dependency() -> None:
         if QdrantClient is None or models is None:
             raise RuntimeError("qdrant-client is not installed. Please run `uv sync` first.")
 
+    def _create_client(self, timeout_seconds: int):
+        self._ensure_dependency()
+        return QdrantClient(
+            url=self.url,
+            api_key=(self.api_key or None),
+            timeout=timeout_seconds,
+        )
+
     def _get_client(self):
         if self._client is None:
-            self._ensure_dependency()
-            self._client = QdrantClient(
-                url=self.url,
-                api_key=(self.api_key or None),
-                timeout=self.CLIENT_TIMEOUT_SECONDS,
-            )
+            self._client = self._create_client(self.CLIENT_TIMEOUT_SECONDS)
         return self._client
 
-    def _collection_exists(self) -> bool:
-        client = self._get_client()
+    def _discard_client(self) -> None:
+        if self._client_was_injected:
+            return
+        client, self._client = self._client, None
+        if client is not None:
+            client.close()
+
+    def _upsert_points(self, points: Sequence[Any]) -> None:
+        for retry_index in range(len(self.UPSERT_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                self._get_client().upsert(
+                    collection_name=self.collection_name,
+                    points=points,
+                    wait=True,
+                )
+                return
+            except ResponseHandlingException as exc:
+                self._discard_client()
+                if retry_index == len(self.UPSERT_RETRY_DELAYS_SECONDS):
+                    raise
+                delay_seconds = self.UPSERT_RETRY_DELAYS_SECONDS[retry_index]
+                logger.warning(
+                    "Retrying Qdrant upsert after connection failure collection={} retry={}/{} delay_seconds={} detail={}",
+                    self.collection_name,
+                    retry_index + 1,
+                    len(self.UPSERT_RETRY_DELAYS_SECONDS),
+                    delay_seconds,
+                    exc,
+                )
+                time.sleep(delay_seconds)
+
+    def _collection_exists(self, client: Any | None = None) -> bool:
+        client = client if client is not None else self._get_client()
         collection_exists = getattr(client, "collection_exists", None)
         if callable(collection_exists):
             return bool(collection_exists(self.collection_name))
@@ -109,7 +150,7 @@ class QdrantThumbnailStore:
                 max_optimization_threads=self.MAX_OPTIMIZATION_THREADS,
                 indexing_threshold=self.INDEXING_THRESHOLD,
             ),
-            # payload 也落盘，避免百万级元数据索引额外抬高常驻内存。
+            # 非索引 payload 落盘，避免普通元数据常驻内存。
             on_disk_payload=True,
         )
 
@@ -217,16 +258,18 @@ class QdrantThumbnailStore:
                 client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field_name,
-                    field_schema=models.PayloadSchemaType.INTEGER,
+                    field_schema=models.IntegerIndexParams(
+                        type=models.IntegerIndexType.INTEGER,
+                        lookup=True,
+                        range=False,
+                        on_disk=True,
+                    ),
                     wait=True,
                 )
             except Exception as exc:
                 if self._is_existing_index_error(exc):
                     continue
                 raise
-
-    def ensure_vector_index(self) -> bool:
-        return False
 
     def inspect_status(self) -> dict[str, Any]:
         status = {
@@ -270,12 +313,6 @@ class QdrantThumbnailStore:
             return None
         return str(getattr(value, "value", value))
 
-    def optimize(self) -> dict[str, Any]:
-        self.ensure_scalar_indices()
-        if not self._collection_exists():
-            return {"optimized": False}
-        return {"optimized": True}
-
     @staticmethod
     def _prepare_vector(vector: Sequence[float]) -> list[float]:
         return [float(item) for item in vector]
@@ -283,7 +320,6 @@ class QdrantThumbnailStore:
     def upsert_records(self, records: Sequence[ThumbnailVectorRecord]) -> None:
         if not records:
             return
-        self.ensure_table(len(records[0].vector))
         points = []
         for item in records:
             points.append(
@@ -297,7 +333,7 @@ class QdrantThumbnailStore:
                     },
                 )
             )
-        self._get_client().upsert(collection_name=self.collection_name, points=points, wait=True)
+        self._upsert_points(points)
 
     def delete_by_thumbnail_ids(self, thumbnail_ids: Sequence[int]) -> None:
         if not thumbnail_ids or not self._collection_exists():
@@ -326,6 +362,23 @@ class QdrantThumbnailStore:
             ),
             wait=True,
         )
+
+    def clear(self) -> None:
+        if self._client_was_injected:
+            client = self._get_client()
+            if self._collection_exists(client):
+                client.delete_collection(collection_name=self.collection_name)
+            return
+
+        client = self._create_client(self.CLEAR_TIMEOUT_SECONDS)
+        try:
+            if self._collection_exists(client):
+                client.delete_collection(
+                    collection_name=self.collection_name,
+                    timeout=self.CLEAR_TIMEOUT_SECONDS,
+                )
+        finally:
+            client.close()
 
     @staticmethod
     def _build_filter(

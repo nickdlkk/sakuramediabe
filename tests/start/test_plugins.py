@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import ValidationError
 
 from src.config.config import Plugins
 from src.plugins import HOST_API_VERSION
@@ -19,9 +19,14 @@ from src.plugins.extensions.ranking import (
     PluginRankingBoard,
     PluginRankingSource,
 )
-from src.plugins.loader import PLUGIN_LOAD_ERRORS, check_plugin_dir, load_enabled_plugins
-from src.scheduler.ranking_plugin_adapter import apply_plugin_ranking_sources
+from src.plugins.loader import (
+    PLUGIN_LOAD_ERRORS,
+    check_plugin_dir,
+    load_enabled_plugins,
+)
+from src.plugins.manager import PluginManager
 from src.scheduler.contracts import JobDefinition
+from src.scheduler.ranking_plugin_adapter import apply_plugin_ranking_sources
 from src.scheduler.registry import _build_job_registry
 from src.service.discovery.ranking_service import (
     RANKING_SOURCE_OWNERS,
@@ -71,6 +76,29 @@ def _clear_load_errors():
     PLUGIN_LOAD_ERRORS.clear()
 
 
+def test_plugin_manager_rejects_duplicate_manifest_ids(tmp_path):
+    _write_plugin_dir(tmp_path, "demo_plugin", version="1.0.0")
+    backup_dir = _write_plugin_dir(tmp_path, "demo_plugin-backup", version="0.9.0")
+    manifest_path = backup_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plugin_id"] = "demo_plugin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="插件 plugin_id 重复: demo_plugin"):
+        PluginManager(tmp_path).validate_installation()
+
+
+def test_plugin_manager_rejects_manifest_directory_mismatch(tmp_path):
+    plugin_dir = _write_plugin_dir(tmp_path, "demo_plugin-backup")
+    manifest_path = plugin_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plugin_id"] = "demo_plugin"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="目录名与 manifest.plugin_id 不一致"):
+        PluginManager(tmp_path).validate_installation()
+
+
 def test_loader_loads_plugin_with_params_jobs(tmp_path):
     init_source = """\
 from pydantic import BaseModel
@@ -81,7 +109,7 @@ class FetchParams(BaseModel):
     movie_number: str
 
 def register(context: PluginContext) -> PluginRegistration:
-    def run(reporter):
+    def run(reporter, params):
         return {"ok": True}
     def fetch(reporter, params):
         return params
@@ -97,7 +125,7 @@ def register(context: PluginContext) -> PluginRegistration:
                 cli_name="demo-sync",
                 cli_help="演示定时任务",
                 default_cron="0 5 * * *",
-                service_factory=run,
+                handler=run,
             ),
             JobDefinition(
                 task_key="demo_fetch",
@@ -106,7 +134,7 @@ def register(context: PluginContext) -> PluginRegistration:
                 cli_help="演示带参任务",
                 manual_only=True,
                 params_schema=FetchParams,
-                params_handler=fetch,
+                handler=fetch,
             ),
         ),
     )
@@ -155,6 +183,7 @@ def test_loader_isolates_broken_plugin(tmp_path):
     )
     assert [registration.plugin_id for registration in loaded] == ["good_plugin"]
     assert PLUGIN_LOAD_ERRORS["bad_plugin"]["stage"] == "register"
+    assert "boom" in PLUGIN_LOAD_ERRORS["bad_plugin"]["message"]
 
 
 def test_loader_clears_stale_error_on_success(tmp_path):
@@ -174,6 +203,30 @@ def test_loader_clears_stale_error_on_success(tmp_path):
     loaded = load_enabled_plugins(Plugins(enabled=["demo_plugin"]), root_dir=root)
     assert [registration.plugin_id for registration in loaded] == ["demo_plugin"]
     assert PLUGIN_LOAD_ERRORS == {}
+
+
+def test_loader_clears_modules_after_failed_import(tmp_path):
+    import sys
+
+    root = tmp_path / "root"
+    plugin_dir = _write_plugin_dir(
+        root,
+        "broken_plugin",
+        init_source="from .state import VALUE\nraise RuntimeError(VALUE)\n",
+    )
+    (plugin_dir / "state.py").write_text("VALUE = 'boom'\n", encoding="utf-8")
+
+    loaded = load_enabled_plugins(
+        Plugins(enabled=["broken_plugin"]),
+        root_dir=root,
+    )
+
+    assert loaded == ()
+    assert PLUGIN_LOAD_ERRORS["broken_plugin"]["stage"] == "import"
+    assert not any(
+        name.startswith("sakuramedia_plugins.broken_plugin")
+        for name in sys.modules
+    )
 
 
 def test_registration_version_mismatch_rejected(tmp_path):
@@ -240,7 +293,55 @@ def test_check_plugin_dir_validates_and_cleans_modules(tmp_path):
         check_plugin_dir(plugin_dir=plugin_dir)
 
 
-def test_job_params_validation_rules():
+def test_check_plugin_dir_does_not_reuse_stale_plugin_submodules(tmp_path):
+    import sys
+
+    from src.plugins.loader import _load_plugin_dir
+
+    old_plugin_dir = _write_plugin_dir(
+        tmp_path / "old",
+        "demo_plugin",
+        init_source="from .plugin import register\n",
+    )
+    new_plugin_dir = _write_plugin_dir(
+        tmp_path / "new",
+        "demo_plugin",
+        init_source="from .plugin import register\n",
+    )
+
+    def write_plugin_module(plugin_dir, version: str) -> None:
+        plugin_path = plugin_dir / "plugin.py"
+        plugin_path.write_text(
+            "from src.plugins import HOST_API_VERSION, PluginRegistration\n"
+            f"VERSION = {version!r}\n"
+            "def register(context):\n"
+            "    return PluginRegistration("
+            "plugin_id='demo_plugin', display_name='x', version=VERSION, "
+            "host_api_version=HOST_API_VERSION, jobs=())\n",
+            encoding="utf-8",
+        )
+
+    write_plugin_module(old_plugin_dir, "1.0.0")
+    _load_plugin_dir(
+        plugin_id="demo_plugin",
+        plugin_dir=old_plugin_dir,
+        plugin_settings=Plugins(),
+    )
+    assert "sakuramedia_plugins.demo_plugin.plugin" in sys.modules
+
+    (new_plugin_dir / "manifest.json").write_text(
+        (new_plugin_dir / "manifest.json").read_text(encoding="utf-8").replace(
+            '"version": "1.0.0"', '"version": "2.0.0"'
+        ),
+        encoding="utf-8",
+    )
+    write_plugin_module(new_plugin_dir, "2.0.0")
+
+    registration = check_plugin_dir(plugin_dir=new_plugin_dir)
+    assert registration.version == "2.0.0"
+
+
+def test_job_definition_requires_handler_and_valid_schedule():
     with pytest.raises(ValidationError):
         JobDefinition(
             task_key="x",
@@ -249,7 +350,7 @@ def test_job_params_validation_rules():
             cli_help="x",
             manual_only=True,
             default_cron="0 5 * * *",
-            service_factory=lambda reporter: None,
+            handler=lambda reporter, params: None,
         )
     with pytest.raises(ValidationError):
         JobDefinition(
@@ -258,9 +359,38 @@ def test_job_params_validation_rules():
             cli_name="x",
             cli_help="x",
             default_cron="0 5 * * *",
-            service_factory=lambda reporter: None,
-            params_schema=BaseModel,
         )
+
+
+def test_job_definition_binds_null_params_to_empty_object():
+    calls = []
+
+    job_def = JobDefinition(
+        task_key="demo_handler",
+        log_name="demo-handler",
+        cli_name="demo-handler",
+        cli_help="handler",
+        default_cron="0 5 * * *",
+        handler=lambda reporter, params: calls.append(params) or {},
+    )
+
+    job_def.build_executor(None)(object())
+    job_def.build_executor({"value": 7})(object())
+
+    assert calls == [{}, {"value": 7}]
+
+
+def test_job_definition_rejects_non_object_params():
+    job_def = JobDefinition(
+        task_key="demo_handler",
+        log_name="demo-handler",
+        cli_name="demo-handler",
+        cli_help="handler",
+        manual_only=True,
+        handler=lambda reporter, params: {},
+    )
+    with pytest.raises(ValueError, match="JSON object"):
+        job_def.build_executor(["invalid"])
 
 
 def test_host_api_version_range_enforced():
@@ -272,6 +402,25 @@ def test_host_api_version_range_enforced():
             display_name="x",
             version="1.0.0",
             host_api_version=HOST_API_VERSION + 1,
+        )
+
+
+def test_plugin_id_length_matches_storage_contract():
+    from src.plugins.manifest import PluginManifest
+
+    plugin_id = "a" + ("b" * 64)
+    with pytest.raises(ValidationError):
+        PluginRegistration(
+            plugin_id=plugin_id,
+            display_name="x",
+            version="1.0.0",
+        )
+    with pytest.raises(ValidationError):
+        PluginManifest(
+            plugin_id=plugin_id,
+            display_name="x",
+            version="1.0.0",
+            host_api_version=HOST_API_VERSION,
         )
 
 
@@ -308,14 +457,40 @@ def test_manifest_host_api_version_range_enforced(tmp_path):
         root_dir=tmp_path,
     )
     assert loaded == ()
-    assert PLUGIN_LOAD_ERRORS[plugin_id]["stage"] == "validate_registration"
+    assert PLUGIN_LOAD_ERRORS[plugin_id]["stage"] == "validate_manifest"
 
 
-def test_manifest_register_version_mismatch_accepts_manifest(tmp_path):
-    """register 不显式传 host_api_version 时默认跟随宿主（v1 老插件漂移为 2）：
+def test_loader_rejects_incompatible_manifest_before_plugin_import(tmp_path):
+    import json
 
-    manifest 声明 1 仍以 manifest 为准正常加载，不静默拒绝（运行期行为按 v2 语义）。
-    """
+    from src.config.config import Plugins
+    from src.plugins.loader import PLUGIN_LOAD_ERRORS, load_enabled_plugins
+
+    plugin_id = "future_plugin"
+    package = tmp_path / plugin_id
+    package.mkdir()
+    (package / "manifest.json").write_text(
+        json.dumps(
+            {
+                "plugin_id": plugin_id,
+                "display_name": "future",
+                "version": "1.0.0",
+                "host_api_version": HOST_API_VERSION + 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('plugin import must not run')\n",
+        encoding="utf-8",
+    )
+
+    assert load_enabled_plugins(Plugins(enabled=[plugin_id]), root_dir=tmp_path) == ()
+    assert PLUGIN_LOAD_ERRORS[plugin_id]["stage"] == "validate_manifest"
+
+
+def test_manifest_register_version_mismatch_rejects_legacy_plugin(tmp_path):
+    """旧 Host API 不再通过兼容分支加载。"""
     import json
 
     from src.config.config import Plugins
@@ -343,16 +518,13 @@ def test_manifest_register_version_mismatch_accepts_manifest(tmp_path):
         encoding="utf-8",
     )
 
-    loaded = load_enabled_plugins(
-        Plugins(enabled=[plugin_id]),
-        root_dir=tmp_path,
-    )
-    assert [registration.plugin_id for registration in loaded] == [plugin_id]
-    assert PLUGIN_LOAD_ERRORS == {}
+    loaded = load_enabled_plugins(Plugins(enabled=[plugin_id]), root_dir=tmp_path)
+    assert loaded == ()
+    assert PLUGIN_LOAD_ERRORS[plugin_id]["stage"] == "validate_manifest"
 
 
 def test_registry_skips_plugin_job_conflicting_with_queue_key():
-    def run(reporter):
+    def run(reporter, params):
         return {}
 
     registration = PluginRegistration(
@@ -361,12 +533,12 @@ def test_registry_skips_plugin_job_conflicting_with_queue_key():
         version="1.0.0",
         jobs=(
             JobDefinition(
-                task_key="media_directory_import",
+                task_key="library_import",
                 log_name="bad-job",
                 cli_name="bad-job",
                 cli_help="x",
                 default_cron="0 5 * * *",
-                service_factory=run,
+                handler=run,
             ),
         ),
     )
@@ -376,7 +548,7 @@ def test_registry_skips_plugin_job_conflicting_with_queue_key():
 
 
 def test_registry_isolates_plugin_job_conflicting_with_builtin():
-    def run(reporter):
+    def run(reporter, params):
         return {}
 
     builtin = JobDefinition(
@@ -385,7 +557,7 @@ def test_registry_isolates_plugin_job_conflicting_with_builtin():
         cli_name="builtin-x",
         cli_help="x",
         cron_setting="movie_heat_cron",
-        service_factory=run,
+        handler=run,
     )
     plugin_job = JobDefinition(
         task_key="builtin_x",
@@ -393,7 +565,7 @@ def test_registry_isolates_plugin_job_conflicting_with_builtin():
         cli_name="plugin-x",
         cli_help="x",
         default_cron="0 5 * * *",
-        service_factory=run,
+        handler=run,
     ).model_copy(update={"plugin_id": "bad_plugin"})
     registration = PluginRegistration(
         plugin_id="bad_plugin",

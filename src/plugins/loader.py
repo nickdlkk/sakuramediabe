@@ -14,17 +14,26 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from loguru import logger
+from pydantic import BaseModel
 
 from src.config.config import Plugins
 from src.plugins.context import PluginContext
 from src.plugins.contracts import (
     HOST_API_VERSION,
-    MIN_SUPPORTED_HOST_API_VERSION,
     PluginRegistration,
+    validate_host_api_version,
+)
+from src.plugins.dependencies import (
+    dependency_failure_message,
+    enable_dependency_site_packages,
 )
 from src.plugins.extensions import EXTENSION_VALIDATORS
+from src.plugins.extensions.metadata import (
+    METADATA_SOURCE_EXTENSION_KEY,
+    METADATA_SOURCE_HOST_API_VERSION,
+)
 from src.plugins.manifest import MANIFEST_FILENAME, load_manifest_from_file
+from src.plugins.provider_protocol import refresh_media_provider_registry
 from src.scheduler.contracts import JobDefinition
 
 PLUGIN_MODULE_NAMESPACE = "sakuramedia_plugins"
@@ -42,12 +51,20 @@ class PluginLoadError(RuntimeError):
         super().__init__(f"插件加载失败 plugin_id={plugin_id} stage={stage}: {message}")
 
 
+def _clear_plugin_modules(plugin_id: str) -> None:
+    """清除插件根模块及其子模块，避免更新时混用旧代码。"""
+    module_name = f"{PLUGIN_MODULE_NAMESPACE}.{plugin_id}"
+    for name in list(sys.modules):
+        if name == module_name or name.startswith(f"{module_name}."):
+            sys.modules.pop(name, None)
+
+
 def _import_plugin_package(plugin_dir: Path, plugin_id: str):
     """把插件目录作为包导入（支持插件内部相对导入）。"""
     init_path = plugin_dir / "__init__.py"
     module_name = f"{PLUGIN_MODULE_NAMESPACE}.{plugin_id}"
     # 清除同进程内可能残留的旧模块（例如加载失败后重试），避免复用过期状态。
-    sys.modules.pop(module_name, None)
+    _clear_plugin_modules(plugin_id)
     spec = importlib.util.spec_from_file_location(
         module_name,
         init_path,
@@ -58,8 +75,28 @@ def _import_plugin_package(plugin_dir: Path, plugin_id: str):
     module = importlib.util.module_from_spec(spec)
     # 先注册再 exec，保证插件内部的相对导入（from .settings import ...）可解析。
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        _clear_plugin_modules(plugin_id)
+        raise
     return module
+
+
+def load_plugin_settings_model(plugin_dir: Path) -> type[BaseModel] | None:
+    """读取包根声明的配置模型，不执行 register，也不校验当前配置。"""
+    manifest = load_manifest_from_file(plugin_dir)
+    if manifest.settings_model is None:
+        return None
+    validate_host_api_version(manifest.host_api_version)
+    enable_dependency_site_packages(plugin_dir.parent)
+    module = sys.modules.get(f"{PLUGIN_MODULE_NAMESPACE}.{manifest.plugin_id}")
+    if module is None:
+        module = _import_plugin_package(plugin_dir, manifest.plugin_id)
+    model = getattr(module, manifest.settings_model, None)
+    if not isinstance(model, type) or not issubclass(model, BaseModel):
+        raise TypeError("settings_model 必须指向包根导出的 Pydantic 配置类")
+    return model
 
 
 def _freeze_settings(value: Any) -> Any:
@@ -147,6 +184,17 @@ def _load_plugin_dir(
         raise PluginLoadError(
             plugin_id, "resolve", f"manifest.plugin_id={manifest.plugin_id} 与启用项不一致"
         )
+    try:
+        validate_host_api_version(manifest.host_api_version)
+    except ValueError as exc:
+        raise PluginLoadError(plugin_id, "validate_manifest", str(exc)) from exc
+    dependency_error = dependency_failure_message(
+        root_dir=plugin_dir.parent,
+        manifest=manifest,
+    )
+    if dependency_error is not None:
+        raise PluginLoadError(plugin_id, "dependencies", dependency_error)
+    enable_dependency_site_packages(plugin_dir.parent)
 
     try:
         module = _import_plugin_package(plugin_dir, plugin_id)
@@ -173,7 +221,9 @@ def _load_plugin_dir(
         if isinstance(exc, PluginLoadError):
             raise
         raise PluginLoadError(
-            plugin_id, "register", "register(context) 执行或返回值校验失败"
+            plugin_id,
+            "register",
+            f"register(context) 执行或返回值校验失败: {exc}",
         ) from exc
 
     if registration.plugin_id != plugin_id:
@@ -189,37 +239,28 @@ def _load_plugin_dir(
             "register 返回的 version 与 manifest 不一致: "
             f"register={registration.version} manifest={manifest.version}",
         )
-    if not (
-        MIN_SUPPORTED_HOST_API_VERSION
-        <= manifest.host_api_version
-        <= HOST_API_VERSION
-    ):
+    # Legacy packages exist in both forms: some retain their v4 registration,
+    # while the official plugins import the host's current constant at
+    # runtime.  The manifest remains the pre-import compatibility boundary.
+    supported_registration_versions = {
+        manifest.host_api_version,
+        HOST_API_VERSION,
+    }
+    if registration.host_api_version not in supported_registration_versions:
         raise PluginLoadError(
             plugin_id,
             "validate_registration",
-            "manifest 声明的 Host API 版本不兼容: "
-            f"manifest={manifest.host_api_version} "
-            f"host=[{MIN_SUPPORTED_HOST_API_VERSION},{HOST_API_VERSION}]",
+            "register 返回的 host_api_version 与 manifest/宿主版本不兼容: "
+            f"register={registration.host_api_version} "
+            f"manifest={manifest.host_api_version} host={HOST_API_VERSION}",
         )
-    if registration.host_api_version != manifest.host_api_version:
-        # manifest 是插件版本的唯一声明入口；register 返回的 host_api_version 默认
-        # 跟随宿主当前版本漂移（v1 时代默认 1，宿主升级 v2 后默认 2），老插件因此
-        # 常出现声明不一致，属预期漂移，不拒绝加载，以 manifest 为准并告警。
-        logger.warning(
-            "插件 Host API 版本声明不一致 plugin_id={} manifest={} register={}，以 manifest 为准",
-            plugin_id,
-            manifest.host_api_version,
-            registration.host_api_version,
-        )
-    if manifest.host_api_version < HOST_API_VERSION:
-        # 运行期行为统一按 v2 语义（v2-lite 字段主权）：import_movie_by_number 返回
-        # 不可变 MovieSnapshot 而非可写 ORM 对象，依赖旧返回值的 v1 插件必须升级。
-        logger.warning(
-            "插件声明旧版 Host API plugin_id={} manifest={} host={}：运行期行为按 v2 语义，"
-            "import_movie_by_number 返回 MovieSnapshot，依赖旧返回值的插件必须升级",
-            plugin_id,
-            manifest.host_api_version,
-            HOST_API_VERSION,
+
+    if (
+        any(ext.key == METADATA_SOURCE_EXTENSION_KEY for ext in registration.extensions)
+        and manifest.host_api_version < METADATA_SOURCE_HOST_API_VERSION
+    ):
+        raise PluginLoadError(
+            plugin_id, "validate_extensions", "元数据来源插件的 manifest 必须声明 Host API 6 或更高版本"
         )
 
     jobs = _validate_plugin_jobs(
@@ -230,7 +271,9 @@ def _load_plugin_dir(
         plugin_id=plugin_id,
         registration=registration,
     )
-    return registration.model_copy(update={"jobs": jobs})
+    return registration.model_copy(update={
+        "jobs": jobs, "host_api_version": manifest.host_api_version,
+    })
 
 
 def check_plugin_dir(
@@ -245,7 +288,6 @@ def check_plugin_dir(
     """
     plugin_dir = Path(plugin_dir)
     plugin_id = plugin_dir.name
-    module_name = f"{PLUGIN_MODULE_NAMESPACE}.{plugin_id}"
     try:
         return _load_plugin_dir(
             plugin_id=plugin_id,
@@ -253,12 +295,7 @@ def check_plugin_dir(
             plugin_settings=plugin_settings or Plugins(),
         )
     finally:
-        for name in [
-            name
-            for name in sys.modules
-            if name == module_name or name.startswith(f"{module_name}.")
-        ]:
-            del sys.modules[name]
+        _clear_plugin_modules(plugin_id)
 
 
 def load_enabled_plugins(
@@ -291,13 +328,25 @@ def load_enabled_plugins(
             loaded.append(registration)
             PLUGIN_LOAD_ERRORS.pop(plugin_id, None)
         except PluginLoadError as exc:
+            _clear_plugin_modules(plugin_id)
             PLUGIN_LOAD_ERRORS[plugin_id] = {
                 "stage": exc.stage,
                 "message": str(exc),
             }
         except Exception as exc:
+            _clear_plugin_modules(plugin_id)
             PLUGIN_LOAD_ERRORS[plugin_id] = {
                 "stage": "load",
                 "message": str(exc),
             }
-    return tuple(loaded)
+    rejected_provider_plugins = refresh_media_provider_registry(loaded)
+    for rejected_plugin_id in rejected_provider_plugins:
+        PLUGIN_LOAD_ERRORS[rejected_plugin_id] = {
+            "stage": "provider_registry",
+            "message": "media.provider provider_key 与已加载插件重复",
+        }
+    return tuple(
+        registration
+        for registration in loaded
+        if registration.plugin_id not in rejected_provider_plugins
+    )

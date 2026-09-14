@@ -9,7 +9,6 @@ from src.config.config import (
     IndexerKind,
 )
 from src.model import DownloadClient, Indexer, IndexerDownloadClient
-from src.model.enums import DownloadClientKind
 from src.schema.system.indexer_settings import (
     IndexerBoundClientResource,
     IndexerConnectionTestError,
@@ -38,7 +37,6 @@ class IndexerSettingsService:
                 IndexerBoundClientResource(
                     id=link.download_client.id,
                     name=link.download_client.name,
-                    kind=link.download_client.kind,
                 )
             )
         return IndexerSettingsResource(
@@ -250,8 +248,6 @@ class IndexerSettingsService:
                     "api_key": api_key,
                     "download_client_ids": cls._validate_download_client_ids(
                         item.download_client_ids,
-                        indexer_kind=kind,
-                        indexer_name=name,
                     ),
                 }
             )
@@ -259,19 +255,9 @@ class IndexerSettingsService:
         return indexers
 
     @staticmethod
-    def _validate_download_client_ids(
-        values: list[int],
-        *,
-        indexer_kind: IndexerKind,
-        indexer_name: str,
-    ) -> list[int]:
-        # 每个索引器至少绑一个下载器；重复 id 拒绝，保持绑定顺序（挑选时同 kind 内按此顺序）。
-        if not values:
-            raise ApiError(
-                422,
-                "invalid_indexer_settings_download_client_ids",
-                "download_client_ids must contain at least one client",
-            )
+    def _validate_download_client_ids(values: list[int]) -> list[int]:
+        # 历史升级可能保留未绑定索引器；空列表表示暂时没有可用下载器。
+        # 非空时拒绝重复 id，保持绑定顺序（挑选时同 kind 内按此顺序）。
         seen: set[int] = set()
         for value in values:
             if value <= 0:
@@ -297,19 +283,6 @@ class IndexerSettingsService:
                     "Download client not found",
                     {"download_client_id": value},
                 )
-            if (
-                indexer_kind is IndexerKind.PT
-                and download_client.kind == DownloadClientKind.CLOUD115.value
-            ):
-                raise ApiError(
-                    422,
-                    "pt_indexer_cloud115_binding_unsupported",
-                    "PT 索引器不能绑定 115 下载入口",
-                    {
-                        "indexer_name": indexer_name,
-                        "download_client_id": download_client.id,
-                    },
-                )
         return list(values)
 
     @classmethod
@@ -322,9 +295,10 @@ class IndexerSettingsService:
             for item in validated_items:
                 client_ids = item.pop("download_client_ids")
                 indexer = Indexer.create(**item)
-                IndexerDownloadClient.insert_many(
-                    [
-                        {"indexer": indexer.id, "download_client": client_id}
-                        for client_id in client_ids
-                    ]
-                ).execute()
+                if client_ids:
+                    IndexerDownloadClient.insert_many(
+                        [
+                            {"indexer": indexer.id, "download_client": client_id}
+                            for client_id in client_ids
+                        ]
+                    ).execute()

@@ -8,7 +8,6 @@ from src.schema.catalog.movies import (
     MovieCollectionType,
     MovieListItemResource,
     MovieListStatus,
-    MovieSpecialTagFilter,
     TagListItemResource,
 )
 from src.schema.common.pagination import PageResponse
@@ -44,7 +43,6 @@ def list_tag_movies(
     year: int | None = Query(default=None, ge=1),
     status: MovieListStatus = MovieListStatus.ALL,
     collection_type: MovieCollectionType = MovieCollectionType.ALL,
-    special_tag: MovieSpecialTagFilter | None = None,
     sort: str | None = Query(default=None),
     director_name: str | None = Query(default=None),
     maker_name: str | None = Query(default=None),
@@ -58,7 +56,6 @@ def list_tag_movies(
         year=year,
         status=status,
         collection_type=collection_type,
-        special_tag=special_tag,
         sort=sort,
         director_name=parse_optional_exact_text(
             director_name, "director_name", error_code="invalid_movie_filter"

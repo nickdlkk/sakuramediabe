@@ -10,6 +10,14 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from src.plugins.extensions.media_provider import (
+    MEDIA_PROVIDER_EXTENSION_KEY,
+    validate_media_provider_extension,
+)
+from src.plugins.extensions.metadata import (
+    METADATA_SOURCE_EXTENSION_KEY,
+    validate_metadata_extension,
+)
 from src.plugins.extensions.ranking import (
     RANKING_SOURCE_EXTENSION_KEY,
     validate_ranking_extension,
@@ -17,7 +25,7 @@ from src.plugins.extensions.ranking import (
 
 # key -> validator(plugin_id, extension)；未登记的 key 会被 loader 拒绝。
 EXTENSION_VALIDATORS: dict[str, Callable[..., Any]] = {
+    METADATA_SOURCE_EXTENSION_KEY: validate_metadata_extension,
     RANKING_SOURCE_EXTENSION_KEY: validate_ranking_extension,
+    MEDIA_PROVIDER_EXTENSION_KEY: validate_media_provider_extension,
 }
-
-SUPPORTED_EXTENSION_KEYS: frozenset[str] = frozenset(EXTENSION_VALIDATORS)

@@ -8,12 +8,12 @@ from src.model.catalog.tags import Tag
 from src.model.mixins import TimestampedMixin
 
 # 受保护字段白名单（v2-lite 字段主权）：插件可写字段的宿主固定名单。
-# 当前开放 title / summary / maker_name / director_name（宿主严格刷新已收敛走
-# gateway，插件可补充/修正文案与厂商/导演信息）；后续每个可写字段必须由第一个
+# 开放文案、厂商/导演、合集判定与屏蔽状态；宿主刷新和人工修改均收敛走 gateway。
+# 屏蔽写入还需校验订阅状态。后续每个可写字段必须由第一个
 # 真实插件提出、补 MOVIE_FIELD_CODECS 类型校验、并收敛对应宿主写点后才加入。
 # 白名单非空后，已持久化 Movie 的裸 save() 会被护栏拒绝。
 PROTECTED_MOVIE_FIELDS: frozenset[str] = frozenset(
-    {"title", "summary", "maker_name", "director_name"}
+    {"title", "summary", "maker_name", "director_name", "is_collection", "is_blacklisted"}
 )
 
 # 受保护字段 codec：字段名 -> 接受的值类型；开放写入前必须补上（v2-lite 文档约定）。
@@ -22,6 +22,8 @@ MOVIE_FIELD_CODECS: dict[str, type] = {
     "summary": str,
     "maker_name": str,
     "director_name": str,
+    "is_collection": bool,
+    "is_blacklisted": bool,
 }
 
 
@@ -38,7 +40,9 @@ class MovieSeries(TimestampedMixin, BaseModel):
 
 
 class Movie(TimestampedMixin, BaseModel):
-    javdb_id = CaseSensitiveCharField(max_length=64, unique=True, index=True, verbose_name="JavDB ID")
+    javdb_id = CaseSensitiveCharField(max_length=64, unique=True, index=True, null=True, verbose_name="JavDB ID")
+    metadata_source = JsonbField(null=True)
+    javdb_next_check_at = peewee.DateTimeField(null=True, index=True)
     movie_number = peewee.CharField(max_length=255, unique=True, index=True, verbose_name="番号")
     title = peewee.TextField(verbose_name="标题")
     release_date = peewee.DateTimeField(verbose_name="发布时间", index=True, null=True)
@@ -72,16 +76,30 @@ class Movie(TimestampedMixin, BaseModel):
     director_name = peewee.CharField(max_length=255, verbose_name="导演名称", null=True)
     want_watch_count = peewee.IntegerField(default=0)
     comment_count = peewee.IntegerField(default=0)
+    # 互动数刷新节奏属于影片领域；不再借通用资源任务投影保存成功时间。
+    interaction_synced_at = peewee.DateTimeField(null=True, index=True)
     heat = peewee.IntegerField(null=False, default=0)
     is_collection = peewee.BooleanField(null=False, default=False, index=True)
-    is_collection_overridden = peewee.BooleanField(null=False, default=False, index=True)
     is_subscribed = peewee.BooleanField(null=False, default=False, index=True)
+    is_blacklisted = peewee.BooleanField(null=False, default=False, index=True)
     subscribed_at = peewee.DateTimeField(null=True, index=True)
+    # 订阅资源查询是影片领域状态：保留可见进度与重试预算，不再依赖通用资源任务台账。
+    subscription_search_state = peewee.CharField(
+        max_length=32, default="pending", index=True
+    )
+    subscription_search_attempt_count = peewee.IntegerField(default=0)
+    subscription_search_retry_round = peewee.IntegerField(default=0)
+    subscription_search_last_attempted_at = peewee.DateTimeField(null=True)
+    subscription_search_last_succeeded_at = peewee.DateTimeField(null=True)
+    subscription_search_next_retry_at = peewee.DateTimeField(null=True)
+    subscription_search_error_code = peewee.CharField(max_length=64, null=True)
+    subscription_search_last_error = peewee.TextField(null=True)
+    subscription_search_last_error_at = peewee.DateTimeField(null=True)
     extra = JsonTextField(null=True, default=None, verbose_name="额外元数据")
-    # v2-lite 字段主权：字段 -> "plugin:<id>" 的 owner 映射（缺键代表宿主管理）；
+    # v2-lite 字段主权：字段 -> owner 映射（缺键代表自动宿主管理，host:manual 代表人工）；
     # mutation_revision 只表示受保护字段及其 owner 的版本，不是整条 Movie 的全局版本。
-    # constraints 里的服务端 DEFAULT 与迁移 20260816_01 对齐，保证新库（initdb 渲染）
-    # 与存量库（迁移 ALTER）schema 同构，裸 INSERT 也有兜底。
+    # constraints 里的服务端 DEFAULT 与 v0.5.0 收敛迁移对齐，保证新库（initdb 渲染）
+    # 与 v0.4.21 存量库（迁移 ALTER）schema 同构，裸 INSERT 也有兜底。
     field_owners = JsonbField(
         null=False,
         default=dict,
@@ -115,7 +133,7 @@ class Movie(TimestampedMixin, BaseModel):
         # 分隔符与大小写都是有效信息（一本道 072625_001 与加勒比 072625-001 是两部不同影片，
         # 东热 n0646 的规范写法就是小写）。系统内部各处番号副本列只允许拷贝本列；
         # 人工输入的匹配统一走 service_helpers.find_movie_by_number（大小写不敏感 + 分隔符候选）。
-        self.javdb_id = (self.javdb_id or "").strip()
+        self.javdb_id = (self.javdb_id or "").strip() or None
         self.movie_number = (self.movie_number or "").strip()
         self._guard_protected_field_write(
             only=kwargs.get("only"),
@@ -125,8 +143,7 @@ class Movie(TimestampedMixin, BaseModel):
 
     @classmethod
     def update(cls, *args, **kwargs):
-        # 与 save(only=...) 同级的运行时护栏：批量 UPDATE 同样禁止写受保护字段，
-        # 白名单为空时惰性放行（v2-lite 阶段一不开放任何字段）。
+        # 与 save(only=...) 同级的运行时护栏：批量 UPDATE 同样禁止写受保护字段。
         # peewee 的 __data dict 与 kwargs 会合并，两侧都要检查，杜绝混合调用绕过。
         written_fields: set[str] = set()
         if args and isinstance(args[0], dict):
@@ -148,7 +165,7 @@ class Movie(TimestampedMixin, BaseModel):
             return
         if not only:
             # 未传 only 的 save() 会把 _data 全列写回，可能覆盖插件刚写入的受保护字段，
-            # 因此一旦开放任何字段就必须显式窄更新。白名单为空时无保护对象，放行。
+            # 因此一旦开放任何字段就必须显式窄更新。
             raise RuntimeError(
                 f"已持久化 Movie 的 save() 必须传 only（受保护字段: {sorted(PROTECTED_MOVIE_FIELDS)}）"
             )
@@ -183,10 +200,16 @@ class Movie(TimestampedMixin, BaseModel):
 
     class Meta:
         table_name = "movie"
+        constraints = [
+            SQL(
+                "CONSTRAINT movie_subscription_blacklist_exclusive "
+                "CHECK (NOT (is_subscribed AND is_blacklisted))"
+            )
+        ]
 
 
 # 人工输入按番号点查统一走 UPPER(movie_number) 等值匹配（movie_number_match_expression），
-# 函数索引保证它不退化为顺扫。索引名必须与迁移 20260728_01_add_movie_number_upper_index 一致。
+# 函数索引保证它不退化为顺扫；索引名保持与历史 schema 兼容。
 Movie.add_index(
     peewee.ModelIndex(
         Movie,
@@ -198,7 +221,7 @@ Movie.add_index(
 # 影片卡片列表排序用的复合索引：nullable 排序字段（release_date / subscribed_at）经
 # build_ordered_expressions 渲染为 ``DESC NULLS LAST``，索引与排序表达式同向，planner 直接
 # Index Scan 取页内行，避免全表扫 + 全量排序；反向扫描同时服务 asc 方向。
-# 索引名必须与迁移 20260815_02_add_movie_sort_indexes 一致。
+# 索引名保持与历史 schema 兼容，避免存量库重复创建同义索引。
 Movie.add_index(
     peewee.ModelIndex(
         Movie,
@@ -240,12 +263,20 @@ class MovieTag(BaseModel):
 
 
 class MoviePlotImage(BaseModel):
+    IMAGE_SEARCH_INDEX_STATUS_PENDING = 0
+    IMAGE_SEARCH_INDEX_STATUS_FAILED = 1
+    IMAGE_SEARCH_INDEX_STATUS_SUCCESS = 2
+
     movie = peewee.ForeignKeyField(Movie, backref="plot_image_links", on_delete="CASCADE")
     image = peewee.ForeignKeyField(Image, backref="movie_plot_links", on_delete="CASCADE")
+    image_search_index_status = peewee.IntegerField(default=IMAGE_SEARCH_INDEX_STATUS_PENDING)
 
     class Meta:
         table_name = "movie_plot_image"
-        indexes = ((("movie", "image"), True),)
+        indexes = (
+            (("movie", "image"), True),
+            (("image_search_index_status", "id"), False),
+        )
 
 
 class Subtitle(TimestampedMixin, BaseModel):

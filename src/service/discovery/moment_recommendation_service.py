@@ -27,9 +27,10 @@ from src.schema.discovery import (
     MomentRecommendationItemResource,
     MomentRecommendationPageResource,
 )
-from src.service.discovery.joytag_embedder_client import (
-    JoyTagInferenceClientError,
-    get_joytag_embedder_client,
+from src.service.catalog.movie_list_media_service import attach_movie_list_media
+from src.service.discovery.embedding_client import (
+    EmbeddingClientError,
+    get_embedding_client,
 )
 from src.service.discovery.qdrant_movie_similarity_store import (
     MovieSimilarityIndexError,
@@ -96,7 +97,7 @@ class MomentRecommendationService:
         movie_recommendation_service: MovieRecommendationService | None = None,
     ) -> None:
         self.store = store or get_qdrant_thumbnail_store()
-        self.embedder = embedder or get_joytag_embedder_client()
+        self.embedder = embedder or get_embedding_client()
         self.movie_recommendation_service = (
             movie_recommendation_service or MovieRecommendationService()
         )
@@ -120,6 +121,7 @@ class MomentRecommendationService:
             .switch(MediaThumbnail)
             .join(Media)
             .join(Movie, on=(Media.movie == Movie.movie_number))
+            .where(Movie.is_blacklisted == False)
         )
 
     @classmethod
@@ -175,11 +177,11 @@ class MomentRecommendationService:
         if not image_bytes:
             return None
         try:
-            inference = self.embedder.infer_image_bytes(image_bytes)
-        except (JoyTagInferenceClientError, ValueError) as exc:
-            logger.warning("Moment recommendation JoyTag inference skipped point_id={} detail={}", seed.point.id, exc)
+            vector = self.embedder.embed_images([image_bytes])[0]
+        except (EmbeddingClientError, ValueError) as exc:
+            logger.warning("Moment recommendation embedding skipped point_id={} detail={}", seed.point.id, exc)
             return None
-        return [float(item) for item in inference.vector]
+        return [float(item) for item in vector]
 
     @classmethod
     def _add_candidate(
@@ -416,6 +418,7 @@ class MomentRecommendationService:
     ) -> dict[str, int]:
         safe_limit = max(int(limit), 0)
         seeds = self._load_seeds()
+        emit_progress(progress_callback, current=0, total=0, text="推荐时刻生成 · 正在收集候选")
         candidates_by_thumbnail_id: dict[int, _MomentCandidate] = {}
         visual_candidates = self._collect_visual_candidates(seeds, candidates_by_thumbnail_id) if seeds else 0
         similar_candidates = 0
@@ -425,7 +428,37 @@ class MomentRecommendationService:
         if len(candidates_by_thumbnail_id) < safe_limit:
             popular_candidates = self._collect_popular_candidates(candidates_by_thumbnail_id, safe_limit)
 
+        def build_summary(stored_items: int) -> dict[str, int]:
+            return {
+                "seed_points": len(seeds),
+                "visual_candidates": visual_candidates,
+                "similar_candidates": similar_candidates,
+                "popular_candidates": popular_candidates,
+                "stored_items": stored_items,
+            }
+
+        collected = len(candidates_by_thumbnail_id)
+        emit_progress(
+            progress_callback,
+            current=collected,
+            total=0,
+            text=f"推荐时刻生成 · 已收集候选 {collected} 个",
+            summary_patch=build_summary(0),
+        )
+        emit_progress(
+            progress_callback,
+            current=collected,
+            total=0,
+            text=f"推荐时刻生成 · 正在排序候选 · 已收集 {collected} 个",
+        )
         ranked = self._rank_candidates(list(candidates_by_thumbnail_id.values()), safe_limit)
+        emit_progress(
+            progress_callback,
+            current=collected,
+            total=0,
+            text=f"推荐时刻生成 · 正在写入结果 · 入选 {len(ranked)} 个",
+            summary_patch=build_summary(len(ranked)),
+        )
         generated_at = utc_now_for_db()
         rows = [
             {
@@ -461,20 +494,25 @@ class MomentRecommendationService:
             "popular_candidates": popular_candidates,
             "stored_items": len(ranked),
         }
-        emit_progress(progress_callback, **stats)
         return stats
 
     @classmethod
     def list_items(cls, page: int = 1, page_size: int = 20) -> MomentRecommendationPageResource:
         validate_page(int(page), int(page_size), error_code="invalid_moment_recommendation_filter")
         start = (int(page) - 1) * int(page_size)
-        valid_recommendation_query = MomentRecommendation.select().join(Media).where(Media.valid == True)
+        valid_recommendation_query = (
+            MomentRecommendation.select()
+            .join(Media)
+            .join(Movie, on=(Media.movie == Movie.movie_number))
+            .where(Media.valid == True, Movie.is_blacklisted == False)
+        )
         total = valid_recommendation_query.count()
         # 分页与 total 都基于仍然有效的媒体，避免失效推荐占用页面槽位。
         generated_row = (
             MomentRecommendation.select(MomentRecommendation.generated_at)
             .join(Media)
-            .where(Media.valid == True)
+            .join(Movie, on=(Media.movie == Movie.movie_number))
+            .where(Media.valid == True, Movie.is_blacklisted == False)
             .order_by(MomentRecommendation.generated_at.desc())
             .first()
         )
@@ -495,8 +533,11 @@ class MomentRecommendationService:
 
         thumbnail_by_id = cls._get_thumbnails_by_ids([row.thumbnail_id for row in rows])
         movie_query, _thin_cover_alias = with_movie_card_relations(Movie.select(Movie))
-        movies_by_id = {movie.id: movie for movie in movie_query.where(Movie.id.in_([row.movie_id for row in rows]))}
-        MovieRecommendationService._attach_movie_flags(list(movies_by_id.values()))
+        movies_by_id = {
+            movie.id: movie
+            for movie in movie_query.where(Movie.id.in_([row.movie_id for row in rows]))
+        }
+        attach_movie_list_media(list(movies_by_id.values()))
 
         items: list[MomentRecommendationItemResource] = []
         for row in rows:
@@ -506,7 +547,6 @@ class MomentRecommendationService:
                 continue
             base_resource = MovieListItemResource.from_attributes_model(movie)
             base_resource.can_play = bool(getattr(movie, "can_play", False))
-            base_resource.is_4k = bool(getattr(movie, "is_4k", False))
             items.append(
                 MomentRecommendationItemResource(
                     recommendation_id=row.id,

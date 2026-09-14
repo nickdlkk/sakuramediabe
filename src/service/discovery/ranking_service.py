@@ -11,11 +11,10 @@ from src.api.exception.errors import ApiError
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
     emit_progress,
-    parse_special_tags_text,
     with_movie_card_relations,
 )
 from src.metadata.factory import build_javdb_provider
-from src.model import Media, Movie, RankingItem, get_database
+from src.model import Movie, RankingItem, get_database
 from src.schema.catalog.movies import MovieListItemResource
 from src.schema.discovery import (
     RankedMovieListItemResource,
@@ -24,6 +23,7 @@ from src.schema.discovery import (
     RankingSourceResource,
 )
 from src.service.catalog.catalog_import_service import CatalogImportService
+from src.service.catalog.movie_list_media_service import attach_movie_list_media
 
 
 @dataclass(frozen=True)
@@ -222,17 +222,17 @@ class RankingCatalogService:
         safe_page_size = max(int(page_size), 1)
         start = (safe_page - 1) * safe_page_size
 
-        order_expressions, needs_movie_join = cls._build_board_items_sort(sort)
-        base_query = RankingItem.select().where(
-            RankingItem.source_key == source_key,
-            RankingItem.board_key == board_key,
-            RankingItem.period == normalized_period,
-        )
-        if needs_movie_join:
-            # 按 Movie.heat 排序时 JOIN Movie 表
-            base_query = base_query.join(
-                Movie, on=(RankingItem.movie == Movie.id)
+        order_expressions, _needs_movie_join = cls._build_board_items_sort(sort)
+        base_query = (
+            RankingItem.select()
+            .join(Movie, on=(RankingItem.movie == Movie.id))
+            .where(
+                RankingItem.source_key == source_key,
+                RankingItem.board_key == board_key,
+                RankingItem.period == normalized_period,
+                Movie.is_blacklisted == False,
             )
+        )
         base_query = base_query.order_by(*order_expressions)
         total = base_query.count()
         # 该榜单+周期整批的抓取时间（整榜删旧插新，全批一致），与分页无关
@@ -256,28 +256,12 @@ class RankingCatalogService:
             )
 
         movie_ids = [item.movie_id for item in ranking_rows]
-        movie_numbers = [item.movie_number for item in ranking_rows]
         movie_query, _thin_cover_alias = with_movie_card_relations(Movie.select(Movie))
         movies = {
             movie.id: movie
             for movie in movie_query.where(Movie.id.in_(movie_ids))
         }
-        # 对齐 recommendation_service 权威版：一次性取 media 的 special_tags，
-        # 同时算出可播放与 4K 番号集合，避免 is_4k 恒为 false。
-        playable_movie_numbers: set[str] = set()
-        is_4k_movie_numbers: set[str] = set()
-        media_rows = (
-            Media.select(Media.movie, Media.special_tags)
-            .where(
-                Media.valid == True,
-                Media.movie.in_(movie_numbers),
-            )
-            .tuples()
-        )
-        for movie_number, special_tags in media_rows:
-            playable_movie_numbers.add(movie_number)
-            if "4K" in parse_special_tags_text(special_tags):
-                is_4k_movie_numbers.add(movie_number)
+        attach_movie_list_media(list(movies.values()))
 
         items: list[RankedMovieListItemResource] = []
         for ranking_row in ranking_rows:
@@ -285,8 +269,6 @@ class RankingCatalogService:
             if movie is None:
                 continue
             movie_item = MovieListItemResource.from_attributes_model(movie)
-            movie_item.can_play = movie.movie_number in playable_movie_numbers
-            movie_item.is_4k = movie.movie_number in is_4k_movie_numbers
             items.append(
                 RankedMovieListItemResource.model_validate(
                     {
@@ -378,7 +360,7 @@ class RankingSyncService:
         if movie_numbers:
             existing_movies = {
                 movie.movie_number: movie
-                for movie in Movie.select(Movie.id, Movie.movie_number).where(
+                for movie in Movie.select(Movie.id, Movie.movie_number, Movie.javdb_id, Movie.metadata_source).where(
                     Movie.movie_number.in_(movie_numbers)
                 )
             }
@@ -409,6 +391,12 @@ class RankingSyncService:
                 imported_count += 1
             else:
                 local_hit_count += 1
+                if not movie.javdb_id and movie.metadata_source:
+                    try:
+                        detail = self._get_movie_detail(source_key, movie_number)
+                        movie, _created = self.import_service.import_movie_if_missing(detail)
+                    except Exception as exc:
+                        logger.warning("排行榜影片 JavDB 补录失败，保留本地条目 movie={} detail={}", movie_number, exc)
 
             insert_rows.append(
                 {

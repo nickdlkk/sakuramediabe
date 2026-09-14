@@ -15,11 +15,6 @@ def rest_between_requests(min_seconds: float, max_seconds: float) -> float:
     return random.uniform(min_seconds, max_seconds)
 
 
-async def rest_between_requests_async(min_seconds: float, max_seconds: float) -> float:
-    """取一个降频休息用的随机延迟（秒）的异步版；sleep 由调用方执行。"""
-    return random.uniform(min_seconds, max_seconds)
-
-
 def unlink_ignore_missing(path) -> None:
     """删除文件；文件本就不存在时静默放行（竞态下先删后查的常见场景）。"""
     try:
@@ -311,25 +306,6 @@ def find_movie_by_number(value: str):
         if movie is not None:
             return movie
     return None
-
-
-def media_special_tag_match_expression(media_tag: str):
-    """按空格分隔标签做精确匹配，避免把普通子串误判成命中。"""
-    from src.model import Media
-
-    return (
-        (Media.special_tags == media_tag)
-        | Media.special_tags.startswith(f"{media_tag} ")
-        | Media.special_tags.endswith(f" {media_tag}")
-        | Media.special_tags.contains(f" {media_tag} ")
-    )
-
-
-def parse_special_tags_text(value: str | None) -> list[str]:
-    """将空格分隔的标签文本解析为列表。"""
-    if value is None:
-        return []
-    return [part.strip() for part in value.split() if part.strip()]
 
 
 def with_movie_card_relations(query):

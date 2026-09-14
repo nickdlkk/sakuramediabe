@@ -1,7 +1,7 @@
 """插件管理 API：zip 上传安装、启停、移除与状态查询。
 
-插件在 api/aps 的 import 阶段加载，所有写操作都需要重启两个进程生效；
-``pending_restart`` 就是这两个进程名。安装 = 上传 zip 并发布目录，
+插件在 api/aps 的 import 阶段加载。声明 dependencies 的插件需要完整容器启动，
+在加载前同步依赖；其他插件仍只需重启 api 与 aps。安装 = 上传 zip 并发布目录，
 目标已存在时替换代码并保留 data/。
 """
 
@@ -25,6 +25,10 @@ from src.schema.system.plugins import (
     PluginSettingsResource,
     PluginSettingsUpdateResource,
     PluginSummaryResource,
+)
+from src.service.system.plugin_removal_service import (
+    PluginInUseError,
+    PluginRemovalService,
 )
 
 router = APIRouter(
@@ -78,23 +82,26 @@ def get_plugin(plugin_id: str):
     return detail
 
 
-@router.get("/{plugin_id}/settings", response_model=PluginSettingsResource)
+@router.get("/{plugin_id}/settings", response_model=PluginSettingsResource, response_model_exclude_none=True)
 def get_plugin_settings(plugin_id: str):
     manager = PluginManager()
     try:
         settings_values = manager.get_plugin_settings(plugin_id)
+        definition = manager.get_plugin_settings_definition(plugin_id)
+    except PluginSettingsValidationError as exc:
+        raise ApiError(422, "invalid_plugin_settings", str(exc), {"fields": exc.errors}) from exc
     except ValueError as exc:
         raise ApiError(404, "plugin_not_found", str(exc)) from exc
-    return PluginSettingsResource(settings=settings_values)
+    return PluginSettingsResource(settings=settings_values, **definition)
 
 
-@router.put("/{plugin_id}/settings", response_model=PluginSettingsUpdateResource)
+@router.put("/{plugin_id}/settings", response_model=PluginSettingsUpdateResource, response_model_exclude_none=True)
 def update_plugin_settings(plugin_id: str, payload: dict[str, Any] = Body(...)):
     manager = PluginManager()
     try:
         settings_values = manager.set_plugin_settings(plugin_id, payload)
     except PluginSettingsValidationError as exc:
-        raise ApiError(422, "invalid_plugin_settings", str(exc)) from exc
+        raise ApiError(422, "invalid_plugin_settings", str(exc), {"fields": exc.errors}) from exc
     except ValueError as exc:
         raise ApiError(404, "plugin_not_found", str(exc)) from exc
     return PluginSettingsUpdateResource(
@@ -117,6 +124,8 @@ def install_plugin(
         with temp_path.open("wb") as handle:
             shutil.copyfileobj(file.file, handle)
         result = manager.install_zip(temp_path, sha256=sha256, enable=enable)
+    except ApiError:
+        raise
     except Exception as exc:
         raise ApiError(422, "plugin_install_failed", f"插件安装失败: {exc}") from exc
     finally:
@@ -124,7 +133,37 @@ def install_plugin(
     return PluginInstallResponse(
         plugin_id=result["plugin_id"],
         version=result["version"],
-        pending_restart=["api", "aps"],
+        pending_restart=manager.pending_restart_for(result["plugin_id"]),
+    )
+
+
+@router.post("/{plugin_id}/upgrade", response_model=PluginInstallResponse)
+def upgrade_plugin(
+    plugin_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    sha256: str | None = Form(default=None),
+):
+    """升级已安装插件；发布后由用户自行重启容器使新代码生效。"""
+    _check_upload_size(request)
+    manager = PluginManager()
+    if manager.get_plugin(plugin_id) is None:
+        raise ApiError(404, "plugin_not_found", f"未知插件 plugin_id={plugin_id}")
+    temp_path = _upload_temp_path(manager)
+    try:
+        with temp_path.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle)
+        result = manager.upgrade_zip(plugin_id, temp_path, sha256=sha256)
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(422, "plugin_upgrade_failed", f"插件升级失败: {exc}") from exc
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return PluginInstallResponse(
+        plugin_id=result["plugin_id"],
+        version=result["version"],
+        pending_restart=manager.pending_restart_for(result["plugin_id"]),
     )
 
 
@@ -144,6 +183,7 @@ def set_plugin_enabled(plugin_id: str, enabled: bool):
         enabled=detail["enabled"],
         load_status=detail["load_status"],
         load_error=detail["load_error"],
+        release_api_url=detail["release_api_url"],
     )
 
 
@@ -154,7 +194,9 @@ def remove_plugin(plugin_id: str):
     if detail is None:
         raise ApiError(404, "plugin_not_found", f"未知插件 plugin_id={plugin_id}")
     try:
-        manager.remove(plugin_id)
+        PluginRemovalService.remove(plugin_id)
+    except PluginInUseError as exc:
+        raise ApiError(409, "plugin_in_use", str(exc), exc.details) from exc
     except ValueError as exc:
         raise ApiError(404, "plugin_not_found", str(exc)) from exc
     return PluginInstallResponse(

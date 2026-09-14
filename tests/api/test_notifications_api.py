@@ -14,7 +14,11 @@
 守的是接口行为本身。
 """
 
+import pytest
+from peewee import IntegrityError
+
 from src.model import SystemNotification
+from src.service.system.activity import NotificationDraft, NotificationService
 
 
 def _login(client, username: str) -> str:
@@ -100,18 +104,55 @@ def test_list_notifications_rejects_unknown_category(client, account_user):
     assert response.json()["error"]["code"] == "invalid_activity_filter"
 
 
-def test_mark_single_notification_read_returns_resource(client, account_user):
-    """同一个 MRO 劫持也埋在 mark_notification_read 的 cls.to_resource 上。"""
+def test_activity_bootstrap_does_not_expose_event_cursor(client, account_user):
     token = _login(client, account_user.username)
-    notification = _create_notification("warning", "n-warning")
+    _create_notification("info", "bootstrap-notification")
 
-    response = client.patch(
-        f"/system/notifications/{notification.id}/read",
-        headers=_auth(token),
+    response = client.get("/system/activity/bootstrap", headers=_auth(token))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "latest_event_id" not in body
+    assert body["unread_count"] == 1
+    assert body["notifications"]["total"] == 1
+
+
+def test_notification_create_once_returns_existing_record_and_creates_one_row(test_db):
+    draft = NotificationDraft(
+        category="warning",
+        title="Provider 登录已失效",
+        content="请重新登录。",
+        event_type="provider_auth_expired",
+        dedupe_key="provider_auth_expired:media_library:1",
+        resource_type="media_library",
+        resource_id=1,
     )
 
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["id"] == notification.id
-    assert body["is_read"] is True
-    assert SystemNotification.get_by_id(notification.id).is_read is True
+    first = NotificationService.create_once(draft)
+    second = NotificationService.create_once(draft)
+
+    assert second.id == first.id
+    assert first.event_type == "provider_auth_expired"
+    assert first.dedupe_key == "provider_auth_expired:media_library:1"
+    assert first.resource_type == "media_library"
+    assert first.resource_id == 1
+    assert SystemNotification.select().where(
+        SystemNotification.dedupe_key == draft.dedupe_key
+    ).count() == 1
+
+
+def test_notification_model_rejects_duplicate_non_null_dedupe_key(test_db):
+    SystemNotification.create(
+        category="info",
+        title="first",
+        content="first",
+        dedupe_key="notification:test-duplicate",
+    )
+
+    with pytest.raises(IntegrityError):
+        SystemNotification.create(
+            category="info",
+            title="second",
+            content="second",
+            dedupe_key="notification:test-duplicate",
+        )

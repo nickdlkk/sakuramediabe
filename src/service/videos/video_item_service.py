@@ -5,8 +5,13 @@ from peewee import JOIN, Case, fn
 
 from src.api.exception.errors import ApiError
 from src.common import build_signed_media_url
+from src.common.media_formats import normalize_media_resolution
 from src.common.runtime_time import utc_now_for_db
-from src.common.service_helpers import require_by_id, resolve_sort_expression, validate_page
+from src.common.service_helpers import (
+    require_by_id,
+    resolve_sort_expression,
+    validate_page,
+)
 from src.model import (
     Image,
     Media,
@@ -19,6 +24,7 @@ from src.model import (
     VideoItem,
     get_database,
 )
+from src.plugins.provider_protocol import MEDIA_PROVIDER_REGISTRY
 from src.schema.catalog.actors import ImageResource
 from src.schema.catalog.movies import (
     MovieMediaPointResource,
@@ -48,18 +54,10 @@ class VideoItemService:
         空 / 缺 'x' / 非整数 / 非正值 一律返 (None, None)，由调用方决定回退策略（前端
         瀑布流回退 16:9）。MediaMetadataProbeService 探测失败时本就不写该字段。
         """
-        if not value:
+        normalized = normalize_media_resolution(value)
+        if normalized is None:
             return (None, None)
-        parts = value.split("x", 1)
-        if len(parts) != 2:
-            return (None, None)
-        try:
-            width = int(parts[0])
-            height = int(parts[1])
-        except ValueError:
-            return (None, None)
-        if width <= 0 or height <= 0:
-            return (None, None)
+        width, height = (int(part) for part in normalized.split("x"))
         return (width, height)
 
     @staticmethod
@@ -262,8 +260,6 @@ class VideoItemService:
     @staticmethod
     def _media_items(video: VideoItem) -> list[MovieMediaResource]:
         """组装视频详情页的媒体列表，复用影片媒体资源结构（进度 + 时刻）。"""
-        from src.service.playback.media_service import MediaService
-
         media_items = list(
             Media.select(Media, MediaLibrary)
             .join(MediaLibrary, JOIN.LEFT_OUTER)
@@ -307,12 +303,12 @@ class VideoItemService:
                 )
             )
             media.points = points_by_media_id.get(media.id, [])
-            media.play_url = build_signed_media_url(media.id)
-            media.library_backend = (
-                "cloud115"
-                if MediaService.is_cloud115_media(media)
-                else ("local" if media.library_id is not None else None)
+            bundle = MEDIA_PROVIDER_REGISTRY.require(media.library.provider_key)
+            media.play_url = build_signed_media_url(
+                media.id, delivery=bundle.playback_deliveries[0]
             )
+            media.provider_key = media.library.provider_key
+            media.playback_deliveries = list(bundle.playback_deliveries)
             resources.append(MovieMediaResource.from_attributes_model(media))
         return resources
 
@@ -363,6 +359,35 @@ class VideoItemService:
         update_data = payload.model_dump(exclude_unset=True, by_alias=False)
         if not update_data:
             raise ApiError(422, "validation_error", "At least one field must be provided")
+        obsolete_cover_image = None
+        if "cover_thumbnail_id" in update_data:
+            thumbnail_id = update_data["cover_thumbnail_id"]
+            if thumbnail_id is None:
+                raise ApiError(
+                    422,
+                    "video_cover_thumbnail_required",
+                    "cover_thumbnail_id cannot be null",
+                )
+            thumbnail = (
+                MediaThumbnail.select(MediaThumbnail, Media)
+                .join(Media)
+                .where(
+                    MediaThumbnail.id == thumbnail_id,
+                    Media.video_item == video,
+                )
+                .get_or_none()
+            )
+            if thumbnail is None:
+                raise ApiError(
+                    404,
+                    "video_cover_thumbnail_not_found",
+                    "Video cover thumbnail not found",
+                    {"video_id": video.id, "thumbnail_id": thumbnail_id},
+                )
+            obsolete_cover_image = (
+                video.cover_image if video.cover_image_id is not None else None
+            )
+            video.cover_image = thumbnail.image
         if "title" in update_data and update_data["title"] is not None:
             video.title = update_data["title"]
         if "summary" in update_data and update_data["summary"] is not None:
@@ -371,6 +396,13 @@ class VideoItemService:
             video.release_date = update_data["release_date"]
         video.updated_at = utc_now_for_db()
         video.save()
+        if obsolete_cover_image is not None:
+            from src.service.catalog.image_cleanup_service import ImageCleanupService
+
+            obsolete_image_paths = ImageCleanupService.delete_image_record_if_unused(
+                obsolete_cover_image
+            )
+            ImageCleanupService.delete_obsolete_image_files(obsolete_image_paths)
         return cls.get_video_detail(video.id)
 
     @classmethod

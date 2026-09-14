@@ -8,6 +8,7 @@ EvalPlanQual 阶段重新评估 WHERE）保证原子性：
   失败整次零修改，无 TOCTOU 窗口。
 - ``update_host_unowned``：宿主只更新尚未被接管的字段；NULL-safe 变化检测，
   任一字段真正变化才递增 revision 并刷新 updated_at。
+- ``update_host_manual``：人工写入并取得宿主 owner，可覆盖插件对同一字段的接管。
 
 字段名全部来自宿主白名单常量，不接收任意字符串；值一律参数化。
 """
@@ -18,6 +19,8 @@ import json
 from typing import Any
 
 from src.model.catalog.movies import MOVIE_FIELD_CODECS, PROTECTED_MOVIE_FIELDS, Movie
+
+MANUAL_MOVIE_FIELD_OWNER = "host:manual"
 
 
 class MovieOwnershipGateway:
@@ -42,12 +45,16 @@ class MovieOwnershipGateway:
             if value is None:
                 # 宿主写路径（update_host_unowned）放行 None：maker_name / director_name /
                 # summary 等列允许 NULL，远端详情缺失时以 None 落库是合法数据；
-                # 插件 patch 路径保持 str-only（allow_none=False），拒绝 None。
+                # 插件 patch 路径不允许 None（allow_none=False）。
                 if not allow_none:
-                    raise ValueError(f"字段 {name} 值类型错误: 期望 {expected_type.__name__}")
+                    raise ValueError(
+                        f"字段 {name} 值类型错误: 期望 {expected_type.__name__}"
+                    )
                 continue
             if not isinstance(value, expected_type):
-                raise ValueError(f"字段 {name} 值类型错误: 期望 {expected_type.__name__}")
+                raise ValueError(  # noqa: TRY004 - 插件字段校验已公开为 ValueError
+                    f"字段 {name} 值类型错误: 期望 {expected_type.__name__}"
+                )
 
     @classmethod
     def patch_plugin(
@@ -59,7 +66,7 @@ class MovieOwnershipGateway:
     ) -> bool:
         """插件写字段：每个字段要求“未接管或 owner 是当前插件”，且 revision 匹配。
 
-        单条 UPDATE 原子完成：任一字段条件失败则整次零修改并返回 False，插件应
+        屏蔽已订阅影片也返回 False。单条 UPDATE 原子完成：任一字段条件失败则整次零修改，插件应
         重新读取 snapshot 后决定是否重试。成功时字段值、owner、revision、updated_at
         在同一语句中提交。
         """
@@ -68,15 +75,21 @@ class MovieOwnershipGateway:
         table = Movie._meta.table_name
         assignments = ", ".join(f"{name} = %s" for name in fields)
         owner_conditions = " AND ".join(
-            "(field_owners->>%s IS NULL OR field_owners->>%s = %s)"
-            for _ in fields
+            "(field_owners->>%s IS NULL OR field_owners->>%s = %s)" for _ in fields
         )
-        owner_payload = json.dumps(
-            {name: owner for name in fields}, ensure_ascii=False
-        )
-        params: list[Any] = [*fields.values(), owner_payload, movie_id, expected_revision]
+        owner_payload = json.dumps({name: owner for name in fields}, ensure_ascii=False)
+        params: list[Any] = [
+            *fields.values(),
+            owner_payload,
+            movie_id,
+            expected_revision,
+        ]
         for name in fields:
             params.extend((name, name, owner))
+        # 订阅不属于受保护字段，revision 不会随它变化；在 UPDATE 内检查当前值。
+        subscription_condition = (
+            "AND NOT is_subscribed" if fields.get("is_blacklisted") is True else ""
+        )
         cursor = Movie._meta.database.execute_sql(
             f"""
             UPDATE {table}
@@ -87,6 +100,7 @@ class MovieOwnershipGateway:
             WHERE id = %s
               AND mutation_revision = %s
               AND {owner_conditions}
+              {subscription_condition}
             """,
             params,
         )
@@ -137,6 +151,36 @@ class MovieOwnershipGateway:
         return cursor.rowcount
 
     @classmethod
+    def update_host_manual(cls, movie_ids: list[int], fields: dict[str, Any]) -> int:
+        """人工写入受保护字段，并把这些字段标记为宿主人工 owner。
+
+        这是宿主侧的特权写入口：人工操作可以覆盖插件 owner，后续自动规则会尊重
+        ``host:manual``，但不提供自动恢复或回退语义。
+        """
+        cls._validate_fields(fields, allow_none=True)
+        if not movie_ids:
+            return 0
+        table = Movie._meta.table_name
+        assignments = ", ".join(f"{name} = %s" for name in fields)
+        placeholders = ", ".join("%s" for _ in movie_ids)
+        owner_payload = json.dumps(
+            {name: MANUAL_MOVIE_FIELD_OWNER for name in fields},
+            ensure_ascii=False,
+        )
+        cursor = Movie._meta.database.execute_sql(
+            f"""
+            UPDATE {table}
+            SET {assignments},
+                field_owners = field_owners || %s::jsonb,
+                mutation_revision = mutation_revision + 1,
+                updated_at = now()
+            WHERE id IN ({placeholders})
+            """,
+            [*fields.values(), owner_payload, *movie_ids],
+        )
+        return cursor.rowcount
+
+    @classmethod
     def release_plugin_owners(
         cls,
         plugin_id: str,
@@ -161,9 +205,7 @@ class MovieOwnershipGateway:
             # 左结合会把整条结果污染成 NULL）。
             key_placeholders = ", ".join("%s" for _ in fields)
             # 任一目标字段属于该插件即整行更新（字段级独立摘除）。
-            conditions = " OR ".join(
-                "field_owners->>%s = %s" for _ in fields
-            )
+            conditions = " OR ".join("field_owners->>%s = %s" for _ in fields)
             params: list[Any] = [owner, *fields]
             for name in fields:
                 params.extend((name, owner))

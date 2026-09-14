@@ -11,6 +11,7 @@ from src.api.routers.deps import db_deps, get_current_user, require_module_depen
 from src.model.system.user import MODULE_SEARCH
 from src.metadata._providers.models import JavdbMovieReviewResource
 from src.schema.catalog.movies import (
+    MovieBlacklistBatchRequest,
     MovieCollectionMarkRequest,
     MovieCollectionMarkResponse,
     MovieCollectionStatusResource,
@@ -19,12 +20,12 @@ from src.schema.catalog.movies import (
     MovieJavdbSearchRequest,
     MovieListItemResource,
     MovieListStatus,
+    MovieMergedPlaybackResource,
     MovieNumberParseRequest,
     MovieNumberParseResponse,
     MovieNumberSource,
     MovieReviewSort,
     MovieSeriesListRequest,
-    MovieSpecialTagFilter,
     MovieSubscriptionBatchRequest,
     MovieSubscriptionBatchResponse,
     SimilarMovieListItemResource,
@@ -32,6 +33,7 @@ from src.schema.catalog.movies import (
 )
 from src.schema.catalog.subtitles import MovieSubtitleListResource
 from src.schema.common.pagination import PageResponse
+from src.schema.system.jobs import ManualJobTriggerResponse
 from src.service.catalog import (
     MovieMetadataRefreshService,
     MovieService,
@@ -59,13 +61,14 @@ def list_movies(
     year: int | None = Query(default=None, ge=1),
     status: MovieListStatus = MovieListStatus.ALL,
     collection_type: MovieCollectionType = MovieCollectionType.ALL,
-    special_tag: MovieSpecialTagFilter | None = None,
     number_source: MovieNumberSource = MovieNumberSource.ALL,
     sort: str | None = Query(default=None),
     director_name: str | None = Query(default=None),
     maker_name: str | None = Query(default=None),
     heat_min: int | None = Query(default=None, ge=0),
     heat_max: int | None = Query(default=None, ge=0),
+    resolution: str | None = Query(default=None),
+    blacklisted: bool = False,
     page: int = 1,
     page_size: int = 20,
 ):
@@ -76,7 +79,6 @@ def list_movies(
         year=year,
         status=status,
         collection_type=collection_type,
-        special_tag=special_tag,
         number_source=number_source,
         sort=sort,
         director_name=parse_optional_exact_text(
@@ -87,6 +89,8 @@ def list_movies(
         ),
         heat_min=heat_min,
         heat_max=heat_max,
+        resolution=resolution,
+        blacklisted=blacklisted,
         page=page,
         page_size=page_size,
     )
@@ -154,6 +158,18 @@ def batch_unsubscribe_movies(payload: MovieSubscriptionBatchRequest):
     return MovieService.batch_unsubscribe_movies(payload.movie_numbers)
 
 
+@router.put("/blacklist", status_code=status.HTTP_204_NO_CONTENT)
+def blacklist_movies(payload: MovieBlacklistBatchRequest):
+    MovieService.set_blacklisted(payload, blacklisted=True)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.delete("/blacklist", status_code=status.HTTP_204_NO_CONTENT)
+def unblacklist_movies(payload: MovieBlacklistBatchRequest):
+    MovieService.set_blacklisted(payload, blacklisted=False)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.get("/{movie_number}/reviews", response_model=list[JavdbMovieReviewResource])
 def get_movie_reviews(
     movie_number: str,
@@ -201,13 +217,21 @@ def refresh_movie_metadata(movie_number: str):
     return MovieMetadataRefreshService.refresh_movie_metadata(movie_number)
 
 
-# 影片单片翻译 / 互动同步端点已删除：统一走 POST /system/resource-task-actions
-# 的 rerun（only_ids=[movie_id]，强制语义，含无状态行播种），响应携带 task_run_id。
+# 影片单片翻译端点已删除；互动同步由常规定时任务负责。
 
 
-@router.post("/{movie_number}/heat-recompute", response_model=MovieDetailResource)
+@router.post(
+    "/{movie_number}/heat-recompute",
+    response_model=ManualJobTriggerResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def recompute_movie_heat(movie_number: str):
     return MovieTaskService.recompute_movie_heat(movie_number)
+
+
+@router.get("/{movie_number}/merged-playback", response_model=MovieMergedPlaybackResource)
+def get_merged_playback(movie_number: str, library_id: int = Query(..., ge=1)):
+    return MovieService.get_merged_playback(movie_number, library_id)
 
 
 @router.get("/{movie_number}", response_model=MovieDetailResource)

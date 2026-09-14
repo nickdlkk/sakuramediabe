@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 from apscheduler.executors.pool import ThreadPoolExecutor
@@ -10,21 +10,36 @@ from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
 from src.common.database import ensure_database_ready
-from src.common.runtime_time import get_runtime_timezone, get_runtime_timezone_name
+from src.common.runtime_time import (
+    get_runtime_timezone,
+    get_runtime_timezone_name,
+    runtime_now,
+    utc_now_for_db,
+)
 from src.config.config import Scheduler, settings
 from src.model import BackgroundTaskRun
 from src.scheduler.contracts import JobDefinition
 from src.scheduler.registry import JOB_REGISTRY, JOB_REGISTRY_BY_KEY
 from src.scheduler.worker import TaskWorker
-from src.service.system import ActivityService
-from src.service.system.activity_service import TaskRunConflictError
+from src.service.system.activity import TaskRunConflictError
+from src.service.system.activity.task_catalog import TASK_NAME_REGISTRY
 from src.service.system.task_queue_service import (
+    BOOTSTRAP_QUEUE_TASK_KEYS,
+    DEFAULT_LEASE_SECONDS,
+    FAILURE_CODE_QUEUE_LEASE_EXPIRED,
+    INTERNAL_FAILURE_CODE_KEY,
     TaskQueueConflictError,
     TaskQueueService,
 )
-from src.start.recovery import recover_interrupted_tasks
+from src.service.system.telemetry_service import TelemetryService
 
-INTERRUPTED_TASK_RUN_ERROR_MESSAGE = "任务执行中断，等待重试"
+BOOTSTRAP_RETRY_GRACE_SECONDS = 1
+BOOTSTRAP_ERROR_RETRY_SECONDS = 5
+
+
+def resolve_job_task_name(job_def: JobDefinition) -> str:
+    """任务展示名：宿主注册表优先，插件任务回退到 cli_help，不落原始 task_key。"""
+    return TASK_NAME_REGISTRY.get(job_def.task_key) or job_def.cli_help
 
 
 def get_job_cron_setting(job_def: JobDefinition) -> str | None:
@@ -65,79 +80,17 @@ def resolve_job_cron_expr(job_def: JobDefinition) -> str | None:
     return getattr(Scheduler(), job_def.cron_setting)
 
 
-def _prepare_recovery(
-    job_def: JobDefinition,
-    params: dict[str, Any] | None = None,
-) -> tuple[Callable[..., Any], dict[str, int], int]:
-    """统一执行 stale task_run 回收，并把回收统计折叠进任务结果。"""
-    recovered_task_runs = ActivityService.recover_interrupted_task_runs(
-        task_key=job_def.task_key,
-        error_message=INTERRUPTED_TASK_RUN_ERROR_MESSAGE,
-        allow_null_owner=True,
-    )
-    recovery_stats: dict[str, int] = {
-        "recovered_task_runs": len(recovered_task_runs),
-    }
-    if recovered_task_runs and job_def.business_recovery:
-        recovery_stats.update(job_def.business_recovery())
-
-    if params and job_def.params_handler is not None:
-        func: Callable[..., Any] = lambda reporter: job_def.params_handler(reporter, params)
-    elif job_def.service_factory is not None:
-        func = job_def.service_factory
-    else:
-        raise RuntimeError(f"任务缺少执行体 task_key={job_def.task_key}")
-    if recovered_task_runs:
-        original_func = func
-
-        def func_with_recovery(reporter):
-            result = original_func(reporter)
-            if isinstance(result, dict):
-                result.update(recovery_stats)
-                return result
-            return result
-
-        func = func_with_recovery
-
-    return func, recovery_stats, len(recovered_task_runs)
-
-
 def run_job(
     job_def: JobDefinition,
     *,
     trigger_type: str = "scheduled",
-    extra_callbacks: list[Callable[[dict[str, Any]], None]] | None = None,
     params: dict[str, Any] | None = None,
-) -> Any:
-    """通用任务执行入口，供 APS 定时触发和 CLI 手动触发共用。"""
+) -> BackgroundTaskRun | None:
+    """统一任务入口：只入队，实际执行始终由 worker 完成。"""
     ensure_database_ready()
-
-    # 统一先回收当前 task_key 遗留的 task_run，确保 stale mutex 不会卡死后续调度。
-    func, _recovery_stats, _recovered_count = _prepare_recovery(job_def, params=params)
-
-    conflict_policy = "raise" if trigger_type == "manual" else "skip"
-    result = ActivityService.run_task(
-        task_key=job_def.task_key,
-        trigger_type=trigger_type,
-        func=func,
-        log_task_name=job_def.log_name,
-        extra_callbacks=extra_callbacks,
-        mutex_key=f"aps:{job_def.task_key}" if trigger_type in {"manual", "scheduled"} else None,
-        conflict_policy=conflict_policy,
-    )
-    if (
-        trigger_type == "scheduled"
-        and isinstance(result, dict)
-        and result.get("task_skipped") is True
-        and result.get("reason") == "mutex_conflict"
-    ):
-        logger.info(
-            "定时任务因同任务仍在运行而跳过 task_key={} blocking_task_run_id={} blocking_trigger_type={}",
-            job_def.task_key,
-            result.get("blocking_task_run_id"),
-            result.get("blocking_trigger_type"),
-        )
-    return result
+    if trigger_type == "scheduled":
+        return enqueue_scheduled_job(job_def)
+    return submit_manual_job(job_def, params=params)
 
 
 def enqueue_scheduled_job(job_def: JobDefinition) -> BackgroundTaskRun | None:
@@ -149,6 +102,7 @@ def enqueue_scheduled_job(job_def: JobDefinition) -> BackgroundTaskRun | None:
     ensure_database_ready()
     task_run = TaskQueueService.enqueue(
         task_key=job_def.task_key,
+        task_name=resolve_job_task_name(job_def),
         trigger_type="scheduled",
         conflict="skip",
     )
@@ -173,6 +127,7 @@ def submit_manual_job(
     try:
         return TaskQueueService.enqueue(
             task_key=job_def.task_key,
+            task_name=resolve_job_task_name(job_def),
             trigger_type="manual",
             params=params,
             conflict="raise",
@@ -193,33 +148,125 @@ def _schedule_bootstrap_job(
     job_key: str,
     *,
     job_id: str,
-    func: Callable[..., Any] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> None:
-    """把一次性引导任务挂成立刻执行的 date job。
+    """把一次性引导任务挂成立刻入队的 date job。
 
-    复用注册表里 cron 任务的 task_key、mutex 与日志名，因此与定时触发天然互斥；
-    ``func`` 缺省时直接跑该任务本身的 service_factory，只有需要收窄执行范围
-    （例如冷启动只抓单个榜单）时才显式传入。
+    复用注册表里 cron 任务的 task_key 与队列 mutex，因此与定时触发天然互斥；
+    参数统一交给任务自己的 handler 或参数执行体。
     """
+    if job_key not in BOOTSTRAP_QUEUE_TASK_KEYS:
+        raise ValueError(f"unsupported_bootstrap_task_key: {job_key}")
     job_def = JOB_REGISTRY_BY_KEY.get(job_key)
     if job_def is None:
         logger.warning("引导任务未在注册表中，跳过 job_key={}", job_key)
         return
-    task_func = func or job_def.service_factory
+    retry_job_id = f"{job_id}_completion_guard"
 
-    def _runner() -> None:
-        ensure_database_ready()
-        try:
-            ActivityService.run_task(
-                task_key=job_def.task_key,
-                trigger_type="startup",
-                func=task_func,
-                log_task_name=job_def.log_name,
-                mutex_key=f"aps:{job_def.task_key}",
-                conflict_policy="skip",
+    def _remove_completion_guard() -> None:
+        if scheduler.get_job(retry_job_id) is not None:
+            scheduler.remove_job(retry_job_id)
+
+    def _schedule_short_retry(blocking_task_run_id: int | None) -> None:
+        # one-shot date job 的瞬时故障不能让引导永久消失；重试间隔固定且只限两个 key。
+        _remove_completion_guard()
+        scheduler.add_job(
+            _runner,
+            args=[blocking_task_run_id],
+            trigger="date",
+            run_date=runtime_now() + timedelta(seconds=BOOTSTRAP_ERROR_RETRY_SECONDS),
+            id=retry_job_id,
+            replace_existing=True,
+            misfire_grace_time=None,
+        )
+
+    def _schedule_completion_guard(task_run: BackgroundTaskRun) -> None:
+        current_db_time = utc_now_for_db()
+        if task_run.state == "running" and task_run.lease_expires_at is not None:
+            target_db_time = task_run.lease_expires_at + timedelta(
+                seconds=BOOTSTRAP_RETRY_GRACE_SECONDS
             )
+        else:
+            # pending 尚未发放 lease；给 worker 一个完整 lease 周期完成领取与首次执行。
+            target_db_time = current_db_time + timedelta(
+                seconds=DEFAULT_LEASE_SECONDS + BOOTSTRAP_RETRY_GRACE_SECONDS
+            )
+        delay_seconds = max(
+            (target_db_time - current_db_time).total_seconds(),
+            BOOTSTRAP_RETRY_GRACE_SECONDS,
+        )
+        _remove_completion_guard()
+        scheduler.add_job(
+            _runner,
+            args=[task_run.id],
+            trigger="date",
+            run_date=runtime_now() + timedelta(seconds=delay_seconds),
+            id=retry_job_id,
+            replace_existing=True,
+            misfire_grace_time=None,
+        )
+
+    def _enqueue() -> None:
+        try:
+            task_run = TaskQueueService.enqueue(
+                task_key=job_def.task_key,
+                task_name=resolve_job_task_name(job_def),
+                trigger_type="startup",
+                params=params,
+                conflict="raise",
+            )
+        except TaskQueueConflictError as exc:
+            if exc.blocking_task_run_id is None:
+                # 冲突行恰在异常映射前释放 mutex，短延迟后重新走唯一约束裁决。
+                _schedule_short_retry(None)
+                return
+            _follow_blocker(exc.blocking_task_run_id)
+            return
+        if task_run is not None:
+            _schedule_completion_guard(task_run)
+
+    def _follow_blocker(blocking_task_run_id: int) -> None:
+        blocker = TaskQueueService.settle_bootstrap_blocker(
+            task_key=job_def.task_key,
+            task_run_id=blocking_task_run_id,
+        )
+        if blocker is None:
+            _enqueue()
+            return
+        if blocker.state == "completed":
+            _remove_completion_guard()
+            return
+        if blocker.state == "failed":
+            failure_code = (blocker.result_summary or {}).get(
+                INTERNAL_FAILURE_CODE_KEY
+            )
+            if (
+                blocker.trigger_type == "startup"
+                and failure_code != FAILURE_CODE_QUEUE_LEASE_EXPIRED
+            ):
+                # 业务失败保持原有单次执行语义；完成守卫只补偿进程/租约中断。
+                _remove_completion_guard()
+                return
+            _enqueue()
+            return
+        if blocker.state in {"pending", "running"}:
+            _schedule_completion_guard(blocker)
+            return
+        _enqueue()
+
+    def _runner(blocking_task_run_id: int | None = None) -> None:
+        try:
+            ensure_database_ready()
+            if blocking_task_run_id is None:
+                _enqueue()
+            else:
+                _follow_blocker(blocking_task_run_id)
         except Exception:
-            logger.exception("Bootstrap job failed job_key={}", job_key)
+            logger.exception("Bootstrap job enqueue failed job_key={}", job_key)
+            try:
+                _schedule_short_retry(blocking_task_run_id)
+            except Exception:
+                logger.exception("Bootstrap job retry scheduling failed job_key={}", job_key)
 
     # misfire_grace_time=None：避免默认 1s 宽限期把这次"立刻执行"的 date job
     # 在启动瞬时忙碌时静默判成 missed 而丢弃。
@@ -242,8 +289,6 @@ def _bootstrap_gfriends_filetree_refresh(scheduler: BlockingScheduler) -> None:
     try:
         from pathlib import Path
 
-        from src.metadata.factory import refresh_gfriends_filetree
-
         cache_path = Path(settings.metadata.gfriends_filetree_cache_path).expanduser()
         if cache_path.exists():
             age_seconds = time.time() - cache_path.stat().st_mtime
@@ -257,7 +302,8 @@ def _bootstrap_gfriends_filetree_refresh(scheduler: BlockingScheduler) -> None:
             scheduler,
             "gfriends_filetree_refresh",
             job_id="bootstrap_gfriends_filetree_refresh",
-            func=lambda _reporter: refresh_gfriends_filetree(force=False),
+            # 启动预热尊重现有 TTL，不强制刷新；cron 的空参数由 handler 默认 force=True。
+            params={"force": False},
         )
     except Exception:
         logger.exception("Skip bootstrap gfriends filetree refresh due to unexpected error")
@@ -308,6 +354,16 @@ def build_scheduler() -> BlockingScheduler:
             id=job_def.task_key,
             replace_existing=True,
         )
+    if TelemetryService.is_enabled():
+        scheduler.add_job(
+            TelemetryService.report,
+            trigger="interval",
+            hours=1,
+            id="telemetry_heartbeat",
+            next_run_time=runtime_now(),
+            misfire_grace_time=None,
+            replace_existing=True,
+        )
     return scheduler
 
 
@@ -317,11 +373,6 @@ def aps():
         return
     database = ensure_database_ready()
     logger.info("Scheduler runtime database ready {}", type(database).__name__)
-    # APS 进程启动时统一回收由该进程负责的任务类型，并联动清理业务侧 running 状态。
-    recover_interrupted_tasks(
-        trigger_types=("scheduled", "manual", "internal", "startup"),
-        error_message="APS进程重启，任务已中断",
-    )
     scheduler = build_scheduler()
     _bootstrap_gfriends_filetree_refresh(scheduler)
     _bootstrap_movie_similarity_index(scheduler)

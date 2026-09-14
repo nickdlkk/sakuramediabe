@@ -1,16 +1,16 @@
-"""插件契约 v2 回归测试：MovieSnapshot / context.movies / import_movie_by_number。
+"""插件契约回归测试：MovieSnapshot / context.movies / import_movie_by_number。
 
 覆盖 v2-lite 设计文档第 4 节的保证：读取与导入只返回不可变快照、patch 走
-唯一网关、v1 插件（host_api_version=1）继续兼容加载。白名单当前真实开放
-title / summary。
+唯一网关。插件 Host API 只接受当前版本。白名单当前真实开放
+title / summary / is_collection。
 """
 
 from __future__ import annotations
 
 import pytest
 
-from src.model import Movie
-from src.plugins import MOVIE_SNAPSHOT_FIELDS, MovieSnapshot
+from src.model import Actor, Movie, MovieActor, MovieTag, Tag
+from src.plugins import MOVIE_SNAPSHOT_FIELDS, MoviePage, MovieSnapshot
 from src.plugins.context import MovieApi
 from src.plugins.contracts import HOST_API_VERSION, MIN_SUPPORTED_HOST_API_VERSION
 from src.plugins.loader import PLUGIN_LOAD_ERRORS, load_enabled_plugins
@@ -51,8 +51,10 @@ def test_snapshot_is_immutable(test_db):
 
     with pytest.raises(FrozenInstanceError):
         snapshot.movie_id = 99
-    # values/owners 是拷贝：插件改坏快照不影响宿主对象。
-    snapshot.values["title"] = "被插件改坏"
+    with pytest.raises(TypeError):
+        snapshot.values["title"] = "被插件改坏"
+    with pytest.raises(TypeError):
+        snapshot.owners["title"] = "plugin:other"
     fresh = Movie.get_by_id(movie.id)
     assert fresh.title == "旧标题"
 
@@ -84,15 +86,47 @@ def test_movies_find_by_numbers_is_case_and_separator_insensitive(test_db):
     assert [snapshot.values["movie_number"] for snapshot in snapshots] == ["ABP-001"]
 
 
+def test_movies_list_page_walks_full_library_by_id_cursor(test_db):
+    first = _create_movie(test_db, movie_number="ABP-001")
+    second = _create_movie(
+        test_db,
+        javdb_id="javdb-2",
+        movie_number="ABP-002",
+    )
+    third = _create_movie(
+        test_db,
+        javdb_id="javdb-3",
+        movie_number="ABP-003",
+    )
+    api = MovieApi("demo_plugin")
+
+    first_page = api.list_page(limit=2)
+    assert isinstance(first_page, MoviePage)
+    assert [item.movie_id for item in first_page.items] == [first.id, second.id]
+    assert first_page.next_cursor == second.id
+
+    second_page = api.list_page(after_id=first_page.next_cursor, limit=2)
+    assert [item.movie_id for item in second_page.items] == [third.id]
+    assert second_page.next_cursor is None
+
 def test_movies_patch_goes_through_gateway(test_db):
     movie = _create_movie(test_db)
     api = MovieApi("demo_plugin")
 
     assert api.patch(movie.id, {"title": "插件标题"}, expected_revision=0) is True
+    assert api.patch(
+        movie.id,
+        {"is_collection": True},
+        expected_revision=1,
+    ) is True
     snapshot = api.get(movie.id)
     assert snapshot.values["title"] == "插件标题"
-    assert snapshot.owners == {"title": "plugin:demo_plugin"}
-    assert snapshot.revision == 1
+    assert snapshot.values["is_collection"] is True
+    assert snapshot.owners == {
+        "title": "plugin:demo_plugin",
+        "is_collection": "plugin:demo_plugin",
+    }
+    assert snapshot.revision == 2
 
     # 陈旧 revision：返回 False 且零修改。
     assert api.patch(movie.id, {"title": "再次写入"}, expected_revision=0) is False
@@ -103,18 +137,50 @@ def test_movies_patch_goes_through_gateway(test_db):
         api.patch(movie.id, {"heat": 999}, expected_revision=1)
 
 
-def test_import_movie_by_number_returns_snapshot(monkeypatch):
+def test_movie_page_batches_relations_without_cross_movie_leaks(test_db):
+    from playhouse.test_utils import count_queries
+
+    actor = Actor.create(javdb_id="actor-1", name="演员", height_cm=168)
+    tag = Tag.create(name="标签")
+    movies = [
+        _create_movie(
+            test_db, javdb_id=f"j-{i}", movie_number=f"ABP-{i}",
+            series_name="系列", is_blacklisted=True,
+        )
+        for i in range(5)
+    ]
+    for movie in movies[1:]:
+        MovieActor.create(movie=movie, actor=actor)
+        MovieTag.create(movie=movie, tag=tag)
+    with count_queries(only_select=True) as queries:
+        page = MovieApi("demo_plugin").list_page(limit=4)
+    assert queries.count <= 4  # 防止逐部查询关联；允许后续减少查询。
+    assert page.next_cursor == movies[3].id
+    assert page.items[0].actors == ()
+    assert page.items[0].tags == ()
+    for snapshot in page.items[1:]:
+        assert snapshot.values["is_blacklisted"] is True
+        assert snapshot.values["series_name"] == "系列"
+        assert [item.actor_id for item in snapshot.actors] == [actor.id]
+        assert snapshot.actors[0].values["height_cm"] == 168
+        assert [item.tag_id for item in snapshot.tags] == [tag.id]
+
+
+def test_import_movie_by_number_returns_snapshot(test_db, monkeypatch):
     from types import SimpleNamespace
 
     import src.plugins.context as context_module
 
-    movie = Movie(
+    movie = Movie.create(
         javdb_id="javdb-1",
         movie_number="ABP-001",
         title="导入标题",
         summary="导入简介",
     )
-    movie.id = 7
+    actor = Actor.create(javdb_id="import-actor", name="导入演员")
+    tag = Tag.create(name="导入标签")
+    MovieActor.create(movie=movie, actor=actor)
+    MovieTag.create(movie=movie, tag=tag)
 
     def fake_provider(self):
         return provider
@@ -136,52 +202,48 @@ def test_import_movie_by_number_returns_snapshot(monkeypatch):
     snapshot = context.import_movie_by_number("ABP-001")
 
     assert isinstance(snapshot, MovieSnapshot)
-    assert snapshot.movie_id == 7
+    assert snapshot.movie_id == movie.id
     assert snapshot.values["title"] == "导入标题"
     assert snapshot.values["movie_number"] == "ABP-001"
     assert snapshot.revision == 0
     assert snapshot.owners == {}
     # 返回值不再携带任何可写 ORM 句柄。
     assert not hasattr(snapshot, "save")
+    assert snapshot.actors[0].actor_id == actor.id
+    assert snapshot.tags[0].tag_id == tag.id
 
 
-def test_host_api_v2_and_v1_compatibility(tmp_path):
-    """契约 v2 是纯加法：v2 插件默认加载，v1 插件（MIN=1）继续兼容加载。"""
+@pytest.mark.parametrize(
+    "declared", range(MIN_SUPPORTED_HOST_API_VERSION - 1, HOST_API_VERSION + 2)
+)
+@pytest.mark.parametrize("registration_version", ["declared", "host"])
+def test_host_api_accepts_supported_manifest_versions(tmp_path, declared, registration_version):
+    """兼容区间内每个版本均可保留声明版本或跟随宿主，区间外拒绝加载。"""
     import json
 
     from src.config.config import Plugins
 
-    assert HOST_API_VERSION == 2
-    assert MIN_SUPPORTED_HOST_API_VERSION == 1
-
-    for plugin_id, declared in (("v1_plugin", 1), ("v2_plugin", 2)):
-        pkg = tmp_path / plugin_id
-        pkg.mkdir(parents=True, exist_ok=True)
-        (pkg / "manifest.json").write_text(
-            json.dumps(
-                {
-                    "plugin_id": plugin_id,
-                    "display_name": plugin_id,
-                    "version": "1.0.0",
-                    "host_api_version": declared,
-                }
-            ),
-            encoding="utf-8",
-        )
-        source = (
-            "from src.plugins import HOST_API_VERSION, PluginContext, PluginRegistration\n"
-            "def register(context):\n"
-            f"    return PluginRegistration(plugin_id={plugin_id!r}, display_name='x', version='1.0.0', "
-            f"host_api_version={declared}, jobs=())\n"
-        )
-        (pkg / "__init__.py").write_text(source, encoding="utf-8")
-
-    loaded = load_enabled_plugins(
-        Plugins(enabled=["v1_plugin", "v2_plugin"]),
-        root_dir=tmp_path,
+    plugin_id = "version_plugin"
+    pkg = tmp_path / plugin_id
+    pkg.mkdir()
+    (pkg / "manifest.json").write_text(
+        json.dumps({
+            "plugin_id": plugin_id, "display_name": plugin_id, "version": "1.0.0",
+            "host_api_version": declared,
+        }), encoding="utf-8",
     )
-    assert [registration.plugin_id for registration in loaded] == [
-        "v1_plugin",
-        "v2_plugin",
-    ]
-    assert PLUGIN_LOAD_ERRORS == {}
+    version = str(declared) if registration_version == "declared" else "HOST_API_VERSION"
+    (pkg / "__init__.py").write_text(
+        "from src.plugins import HOST_API_VERSION, PluginRegistration\n"
+        "def register(context):\n"
+        f"    return PluginRegistration(plugin_id={plugin_id!r}, display_name='x', "
+        f"version='1.0.0', host_api_version={version}, jobs=())\n",
+        encoding="utf-8",
+    )
+    loaded = load_enabled_plugins(Plugins(enabled=[plugin_id]), root_dir=tmp_path)
+    if MIN_SUPPORTED_HOST_API_VERSION <= declared <= HOST_API_VERSION:
+        assert [registration.plugin_id for registration in loaded] == [plugin_id]
+        assert plugin_id not in PLUGIN_LOAD_ERRORS
+    else:
+        assert loaded == ()
+        assert PLUGIN_LOAD_ERRORS[plugin_id]["stage"] == "validate_manifest"

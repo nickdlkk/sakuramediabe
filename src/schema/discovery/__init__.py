@@ -1,8 +1,10 @@
 from .daily_recommendations import DailyRecommendationMovieResource
-from .hot_reviews import HotReviewListItemResource, HotReviewListResource
+from .hot_actress_releases import HotActressReleaseMovieResource, HotActressResource
 from .image_search import (
     ImageSearchResultItemResource,
     ImageSearchSessionPageResource,
+    MoviePlotImageSearchResultItemResource,
+    MoviePlotImageSearchSessionPageResource,
 )
 from .moment_recommendations import (
     MomentRecommendationItemResource,
@@ -17,12 +19,14 @@ from .rankings import (
 
 __all__ = [
     "DailyRecommendationMovieResource",
-    "HotReviewListItemResource",
-    "HotReviewListResource",
+    "HotActressReleaseMovieResource",
+    "HotActressResource",
     "ImageSearchResultItemResource",
     "ImageSearchSessionPageResource",
     "MomentRecommendationItemResource",
     "MomentRecommendationPageResource",
+    "MoviePlotImageSearchResultItemResource",
+    "MoviePlotImageSearchSessionPageResource",
     "RankedMovieListItemResource",
     "RankingBoardItemsResource",
     "RankingBoardResource",

@@ -1,17 +1,16 @@
 from .file_signatures import (
     build_signed_clip_url,
-    build_signed_cloud115_merged_hls_url,
     build_signed_image_url,
     build_signed_media_url,
     build_signed_merged_media_url,
     build_signed_subtitle_url,
     media_clip_root_path,
     resolve_image_file_path,
-    resolve_media_clip_file_path,
     resolve_subtitle_file_path,
     verify_clip_signature,
     verify_image_signature,
     verify_media_signature,
+    verify_merged_media_signature,
     verify_subtitle_signature,
 )
 from .logging import configure_logging, get_logging_level_name
@@ -35,7 +34,6 @@ from .runtime_time import (
 
 __all__ = [
     "build_signed_clip_url",
-    "build_signed_cloud115_merged_hls_url",
     "build_signed_image_url",
     "build_signed_media_url",
     "build_signed_merged_media_url",
@@ -51,7 +49,6 @@ __all__ = [
     "parse_movie_number_from_text",
     "remove_disturb",
     "resolve_image_file_path",
-    "resolve_media_clip_file_path",
     "resolve_subtitle_file_path",
     "runtime_now",
     "serialize_runtime_local",
@@ -62,5 +59,6 @@ __all__ = [
     "verify_clip_signature",
     "verify_image_signature",
     "verify_media_signature",
+    "verify_merged_media_signature",
     "verify_subtitle_signature",
 ]

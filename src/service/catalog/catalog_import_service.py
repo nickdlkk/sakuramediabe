@@ -9,12 +9,16 @@
 
 from collections.abc import Callable
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from peewee import IntegrityError
 
+from src.common import normalize_movie_number
 from src.common.runtime_time import utc_now_for_db
+from src.common.service_helpers import find_movie_by_number
 from src.metadata._providers.models import (
     JavdbMovieActorResource,
     JavdbMovieDetailResource,
@@ -31,7 +35,11 @@ from src.model import (
     get_database,
 )
 from src.model.catalog.movies import PROTECTED_MOVIE_FIELDS
-from src.service.catalog.movie_collection_service import MovieCollectionService
+from src.plugins.extensions.metadata import PluginMovieMetadata
+from src.service.catalog.actor_ownership_gateway import (
+    JAVDB_ACTOR_FIELD_OWNER,
+    ActorOwnershipGateway,
+)
 from src.service.catalog.movie_heat_service import MovieHeatService
 from src.service.catalog.movie_image_service import (
     ImageDownloadError,
@@ -55,6 +63,8 @@ __all__ = [
 
 class CatalogImportService:
     """承接远端元数据到本地目录模型的 upsert。"""
+
+    JAVDB_CHECK_INTERVAL = timedelta(days=7)
 
     def __init__(
         self,
@@ -125,14 +135,16 @@ class CatalogImportService:
         detail: JavdbMovieDetailResource,
         force_subscribed: bool = False,
     ) -> tuple[Movie, bool]:
-        """纯新建语义：影片已存在（movie_number 或 javdb_id 命中）时跳过，不写任何字段。
+        """已有 JavDB 影片跳过；同番号插件影片原位接入 JavDB。
 
-        返回 ``(movie, created)``。已存在影片的元数据刷新唯一入口是
-        ``refresh_movie_metadata_strict``（手动刷新接口）；指定字段更新走
-        ``update_movie_fields``。
+        返回 ``(movie, created)``。已有 JavDB 影片手动刷新走
+        ``refresh_movie_metadata_strict``；插件影片接入走 ``backfill_plugin_movie``。
         """
         # 快路径：已存在直接返回，零图片 IO。图片下载期间可能被并发导入抢先建好，
         # 事务内会二次确认（图片路径按番号确定性派生，双方下载内容一致，无孤儿文件问题）。
+        local_movie = find_movie_by_number(detail.movie_number)
+        if local_movie is not None and not local_movie.javdb_id and local_movie.metadata_source:
+            return self.backfill_plugin_movie(local_movie, detail), False
         existing_movie = Movie.get_or_none(
             (Movie.movie_number == detail.movie_number)
             | (Movie.javdb_id == detail.javdb_id)
@@ -232,11 +244,6 @@ class CatalogImportService:
             movie.title = detail.title
             movie.javdb_id = detail.javdb_id
             movie.movie_number = detail.movie_number
-            # 手动覆盖优先：已手工标记的影片在导入刷新时保持现状，不按自动规则重算合集状态。
-            if not bool(movie.is_collection_overridden):
-                movie.is_collection = MovieCollectionService.matches_configured_collection(
-                    detail.movie_number,
-                )
             movie.save()
             logger.debug(
                 "Catalog import movie saved movie_id={} movie_number={}",
@@ -249,6 +256,7 @@ class CatalogImportService:
                 actor = self.upsert_actor_from_javdb_resource(
                     actor_resource,
                     profile_image_task=actor_image_tasks_by_javdb_id.get(actor_resource.javdb_id),
+                    update_gender=True,
                 )
                 MovieActor.get_or_create(movie=movie, actor=actor)
                 logger.debug(
@@ -301,6 +309,177 @@ class CatalogImportService:
             movie.movie_number,
         )
         return movie, True
+
+    def import_plugin_movie(
+        self, detail: PluginMovieMetadata, source: dict[str, str | None], provider,
+        *, force_subscribed: bool = False,
+    ) -> tuple[Movie, bool]:
+        from src.service.catalog.metadata_source_service import MetadataSourceService
+
+        existing = find_movie_by_number(detail.movie_number)
+        if existing is not None:
+            return existing, False
+        actors = MetadataSourceService.match_actors(detail.actors, provider, self)
+        with self.image_service.prepare_metadata_images(
+            detail.movie_number,
+            detail.cover_image_path,
+            detail.plot_image_paths,
+            local=True,
+        ) as (cover, plots, _actor_tasks, thin):
+            try:
+                with self.persist_lock or nullcontext(), get_database().atomic():
+                    existing = find_movie_by_number(detail.movie_number)
+                    if existing is not None:
+                        return existing, False
+                    movie = Movie.create(
+                        movie_number=detail.movie_number,
+                        javdb_id=None,
+                        title=detail.title,
+                        summary=detail.summary,
+                        release_date=detail.release_date,
+                        duration_minutes=detail.duration_minutes,
+                        maker_name=detail.maker_name,
+                        director_name=detail.director_name,
+                        series=self._resolve_movie_series(detail.series_name),
+                        cover_image=self.image_service.persist_prepared_image(cover),
+                        metadata_source=source,
+                        javdb_next_check_at=utc_now_for_db() + self.JAVDB_CHECK_INTERVAL,
+                        is_subscribed=force_subscribed,
+                        subscribed_at=utc_now_for_db() if force_subscribed else None,
+                    )
+                    for actor in actors:
+                        MovieActor.get_or_create(movie=movie, actor=actor)
+                    for name in detail.tags:
+                        tag, _ = Tag.get_or_create(name=name)
+                        MovieTag.get_or_create(movie=movie, tag=tag)
+                    images = self.image_service.persist_prepared_images(plots)
+                    by_index = {}
+                    for task in plots:
+                        image = images[task.relative_path]
+                        MoviePlotImage.create(movie=movie, image=image)
+                        by_index[task.plot_index] = image
+                    self._apply_thin_cover_resolution(
+                        movie, None, thin, by_index, refreshed=False
+                    )
+            except IntegrityError:
+                existing = find_movie_by_number(detail.movie_number)
+                if existing is None:
+                    raise
+                return existing, False
+        return movie, True
+
+
+    def backfill_plugin_movie(self, movie: Movie, detail: JavdbMovieDetailResource) -> Movie:
+        if normalize_movie_number(movie.movie_number) != normalize_movie_number(
+            detail.movie_number
+        ):
+            raise ValueError("JavDB 补录番号不匹配")
+        if not detail.javdb_id:
+            raise ValueError("JavDB 补录缺少真实 ID")
+        conflict = (
+            Movie.select()
+            .where((Movie.javdb_id == detail.javdb_id) & (Movie.id != movie.id))
+            .exists()
+        )
+        if conflict:
+            raise ValueError("JavDB ID 已属于其他本地影片")
+        actors = detail.actors if detail.actors_available else []
+        obsolete_paths = set()
+        old_plot_ids = []
+        with (
+            self.image_service.prepare_metadata_images(
+                movie.movie_number, detail.cover_image, detail.plot_images, actors
+            ) as (cover, plots, actor_tasks, thin),
+            self.persist_lock or nullcontext(),
+            get_database().atomic(),
+        ):
+            movie = Movie.select().where(Movie.id == movie.id).for_update().get()
+            if movie.javdb_id:
+                return movie
+            old_images = [movie.cover_image, movie.thin_cover_image]
+            values = {
+                "javdb_id": detail.javdb_id,
+                "javdb_next_check_at": None,
+                "score": detail.score if detail.score is not None else 0,
+                "score_number": detail.score_number,
+                "watched_count": detail.watched_count,
+                "want_watch_count": detail.want_watch_count,
+                "comment_count": detail.comment_count,
+                "extra": detail.extra,
+            }
+            if detail.release_date:
+                values["release_date"] = detail.release_date
+            if detail.duration_minutes > 0:
+                values["duration_minutes"] = detail.duration_minutes
+            if detail.series_name:
+                values["series"] = self._resolve_movie_series(detail.series_name)
+            for name, value in values.items():
+                setattr(movie, name, value)
+            movie.save(only=[Movie._meta.fields[name] for name in values])
+            MovieOwnershipGateway.update_host_unowned(
+                movie.id,
+                {
+                    name: getattr(detail, name)
+                    for name in ("title", "summary", "maker_name", "director_name")
+                    if getattr(detail, name)
+                },
+            )
+            if cover is not None:
+                movie.cover_image = self.image_service.persist_prepared_image(cover)
+                movie.save(only=[Movie.cover_image])
+            by_index = {}
+            if plots:
+                old_links = list(
+                    MoviePlotImage.select().where(MoviePlotImage.movie == movie)
+                )
+                old_images.extend(link.image for link in old_links)
+                old_plot_ids = [link.id for link in old_links]
+                MoviePlotImage.delete().where(MoviePlotImage.movie == movie).execute()
+                images = self.image_service.persist_prepared_images(plots)
+                for task in plots:
+                    image = images[task.relative_path]
+                    MoviePlotImage.create(movie=movie, image=image)
+                    by_index[task.plot_index] = image
+            if thin.generated_task is not None or thin.selected_plot_index is not None:
+                self._apply_thin_cover_resolution(
+                    movie, None, thin, by_index, refreshed=False
+                )
+            if detail.actors_available:
+                old_images.extend(
+                    Image.select()
+                    .join(Actor, on=(Actor.profile_image == Image.id))
+                    .where(Actor.javdb_id.in_([actor.javdb_id for actor in actors]))
+                )
+                MovieActor.delete().where(MovieActor.movie == movie).execute()
+                for actor_detail in actors:
+                    actor = self.upsert_actor_from_javdb_resource(
+                        actor_detail,
+                        profile_image_task=actor_tasks.get(actor_detail.javdb_id),
+                        update_gender=True,
+                    )
+                    MovieActor.get_or_create(movie=movie, actor=actor)
+            if detail.tags_available:
+                self._replace_movie_tags(movie, detail.tags)
+            for image in {
+                image.id: image for image in old_images if image is not None
+            }.values():
+                obsolete_paths.update(
+                    self.image_service.delete_image_record_if_unused(image)
+                )
+            MovieHeatService.update_single_movie_heat(movie.id)
+        try:
+            self.image_service.delete_obsolete_image_files(obsolete_paths)
+            if old_plot_ids:
+                from src.service.discovery.qdrant_plot_image_store import (
+                    get_qdrant_plot_image_store,
+                )
+
+                get_qdrant_plot_image_store().delete_by_plot_image_ids(old_plot_ids)
+        except Exception as exc:
+            logger.warning(
+                "补录完成，旧图片或索引清理失败 movie={} detail={}", movie.id, exc
+            )
+        return Movie.get_by_id(movie.id)
 
     # ③ 允许更新的字段白名单 -> detail 取值器；heat 是推导列不允许直接写，
     # 图片/演员/标签/剧照等关联字段不在本机制内（新建时由 import_movie_if_missing 完整导入）。
@@ -417,10 +596,11 @@ class CatalogImportService:
         new_relative_paths = {prepared.image_task.relative_path for prepared in prepared_files}
         finalized = False
         obsolete_paths: set[str] = set()
+        old_plot_image_ids: list[int] = []
         try:
             lock_context = self.persist_lock or nullcontext()
             with lock_context, get_database().atomic():
-                persisted_movie, obsolete_paths = self._refresh_movie_metadata_records_strict(
+                persisted_movie, obsolete_paths, old_plot_image_ids = self._refresh_movie_metadata_records_strict(
                     movie=movie,
                     detail=detail,
                     actors=actors,
@@ -430,6 +610,19 @@ class CatalogImportService:
                     plot_tasks=plot_tasks,
                     actor_image_tasks_by_javdb_id=actor_image_tasks_by_javdb_id,
                 )
+            if old_plot_image_ids:
+                try:
+                    from src.service.discovery.qdrant_plot_image_store import (
+                        get_qdrant_plot_image_store,
+                    )
+
+                    get_qdrant_plot_image_store().delete_by_plot_image_ids(old_plot_image_ids)
+                except Exception as exc:
+                    logger.warning(
+                        "Delete refreshed plot image vectors failed count={} detail={}",
+                        len(old_plot_image_ids),
+                        exc,
+                    )
             self.image_service.finalize_prepared_image_files(prepared_files)
             self.image_service.delete_obsolete_image_files(obsolete_paths - new_relative_paths)
             finalized = True
@@ -454,7 +647,7 @@ class CatalogImportService:
         cover_task: ImagePersistTask | None,
         plot_tasks: list[ImagePersistTask],
         actor_image_tasks_by_javdb_id: dict[str, ImagePersistTask],
-    ) -> tuple[Movie, set[str]]:
+    ) -> tuple[Movie, set[str], list[int]]:
         # 事务内先锁行重读（v2-lite 字段主权）：锁定期间当前 owner 状态稳定，
         # 之后受保护字段写入以本次读取为准，杜绝旧快照覆盖插件刚写入的值。
         movie = (
@@ -483,11 +676,10 @@ class CatalogImportService:
         )
         if old_plot_links:
             MoviePlotImage.delete().where(MoviePlotImage.movie == movie).execute()
+        old_plot_image_ids = [link.id for link in old_plot_links]
 
         # 演员关系同样按远端列表全量替换，避免残留已下线演员。
         MovieActor.delete().where(MovieActor.movie == movie).execute()
-        # 标签关联同样严格重建，保证旧标签不会残留。
-        MovieTag.delete().where(MovieTag.movie == movie).execute()
 
         images_to_cleanup: dict[int, Image] = {}
         for image in [old_cover_image, old_thin_cover_image, *[plot_link.image for plot_link in old_plot_links]]:
@@ -557,15 +749,7 @@ class CatalogImportService:
             obsolete_paths.update(actor_obsolete_paths)
             MovieActor.get_or_create(movie=movie, actor=actor)
 
-        seen_tag_names: set[str] = set()
-        for tag_resource in tags:
-            normalized_tag_name = (tag_resource.name or "").strip()
-            if not normalized_tag_name or normalized_tag_name in seen_tag_names:
-                continue
-            seen_tag_names.add(normalized_tag_name)
-        for tag_name in seen_tag_names:
-            tag, _ = Tag.get_or_create(name=tag_name)
-            MovieTag.get_or_create(movie=movie, tag=tag)
+        self._replace_movie_tags(movie, tags)
 
         plot_images_by_index: dict[int, Image] = {}
         # 剧照整批一次 upsert，避免逐张 get_or_none + create 的 2N 次往返。
@@ -590,7 +774,15 @@ class CatalogImportService:
         # 受保护字段可能未全部落库（被插件接管的字段保留插件值）：重读该行，
         # 保证返回对象与库内真实状态一致（内存中的远端值不得外泄给调用方）。
         movie = Movie.get_by_id(movie.id)
-        return movie, obsolete_paths
+        return movie, obsolete_paths, old_plot_image_ids
+
+    @staticmethod
+    def _replace_movie_tags(movie: Movie, tags) -> None:
+        MovieTag.delete().where(MovieTag.movie == movie).execute()
+        for name in dict.fromkeys((tag.name or "").strip() for tag in tags):
+            if name:
+                tag, _ = Tag.get_or_create(name=name)
+                MovieTag.get_or_create(movie=movie, tag=tag)
 
     def _refresh_actor_from_javdb_resource_strict(
         self,
@@ -613,7 +805,6 @@ class CatalogImportService:
                     alias_name=merged_alias_name,
                     profile_image=profile_image,
                     javdb_type=actor_resource.javdb_type,
-                    gender=actor_resource.gender,
                 ),
                 set(),
             )
@@ -633,9 +824,8 @@ class CatalogImportService:
             existing_alias_name=actor.alias_name,
         )
         actor.javdb_type = actor_resource.javdb_type
-        actor.gender = actor_resource.gender
         actor.profile_image = profile_image
-        actor.save()
+        actor.save(only=[Actor.name, Actor.alias_name, Actor.javdb_type, Actor.profile_image])
         return actor, obsolete_paths
 
     def backfill_movie_thin_cover(self, movie: Movie) -> bool:
@@ -673,8 +863,14 @@ class CatalogImportService:
         self,
         actor_resource: JavdbMovieActorResource,
         profile_image_task: ImagePersistTask | None = None,
+        *,
+        update_gender: bool = False,
     ) -> Actor:
-        """把 JavDB 演员资源同步到本地，并在可用时补全头像。"""
+        """把 JavDB 演员资源同步到本地，并在可用时补全头像。
+
+        演员搜索等非影片入库场景只能同步身份和头像信息；只有新影片入库
+        显式传入 ``update_gender=True`` 时，才使用影片详情中的性别写入本地。
+        """
         if profile_image_task is None:
             profile_image = self.image_service.persist_image(
                 owner_type="actor",
@@ -686,20 +882,28 @@ class CatalogImportService:
 
         lock_context = self.persist_lock or nullcontext()
         with lock_context, get_database().atomic():
+            explicit_gender = (
+                actor_resource.gender
+                if update_gender and actor_resource.gender in (1, 2)
+                else None
+            )
             merged_alias_name = self._merge_actor_alias_name(
                 primary_name=actor_resource.name,
                 alias_names=actor_resource.alias_names,
                 existing_alias_name="",
             )
+            defaults = {
+                "name": actor_resource.name,
+                "alias_name": merged_alias_name,
+                "profile_image": profile_image,
+                "javdb_type": actor_resource.javdb_type,
+            }
+            if explicit_gender is not None:
+                defaults["gender"] = explicit_gender
+                defaults["field_owners"] = {"gender": JAVDB_ACTOR_FIELD_OWNER}
             actor, created = Actor.get_or_create(
                 javdb_id=actor_resource.javdb_id,
-                defaults={
-                    "name": actor_resource.name,
-                    "alias_name": merged_alias_name,
-                    "profile_image": profile_image,
-                    "javdb_type": actor_resource.javdb_type,
-                    "gender": actor_resource.gender,
-                },
+                defaults=defaults,
             )
             if not created:
                 actor.name = actor_resource.name
@@ -710,10 +914,18 @@ class CatalogImportService:
                     existing_alias_name=actor.alias_name,
                 )
                 actor.javdb_type = actor_resource.javdb_type
-                actor.gender = actor_resource.gender
                 if profile_image is not None:
                     actor.profile_image = profile_image
-                actor.save()
+                columns = [Actor.name, Actor.alias_name, Actor.javdb_type]
+                if profile_image is not None:
+                    columns.append(Actor.profile_image)
+                actor.save(only=columns)
+                if explicit_gender is not None:
+                    ActorOwnershipGateway.update_host_source(
+                        actor.id,
+                        {"gender": explicit_gender},
+                    )
+                    actor = Actor.get_by_id(actor.id)
 
         return actor
 

@@ -1,11 +1,12 @@
 from datetime import date, datetime
 from enum import Enum
-from typing import Any
+from typing import Literal
 
 from pydantic import Field, field_validator
 
 from src.schema.catalog.actors import ImageResource
 from src.schema.common.base import SchemaModel
+from src.schema.common.media import MediaSummaryResource
 from src.schema.common.playlists import PlaylistSummaryResource
 
 
@@ -32,19 +33,6 @@ class MovieCollectionMarkType(str, Enum):
     SINGLE = "single"
 
 
-class MovieSpecialTagFilter(str, Enum):
-    FOUR_K = "4k"
-    UNCENSORED = "uncensored"
-    VR = "vr"
-
-    def to_media_tag(self) -> str:
-        if self == MovieSpecialTagFilter.FOUR_K:
-            return "4K"
-        if self == MovieSpecialTagFilter.UNCENSORED:
-            return "无码"
-        return "VR"
-
-
 class MovieNumberSource(str, Enum):
     # 按番号来源筛选：ALL 不限制，REGULAR 排除 FC2，FC2 仅 FC2（番号以 FC2 开头）。
     ALL = "all"
@@ -57,22 +45,12 @@ class MovieReviewSort(str, Enum):
     HOTLY = "hotly"
 
 
-MOVIE_LIST_SORT_FIELDS = (
-    "release_date",
-    "added_at",
-    "subscribed_at",
-    "comment_count",
-    "score_number",
-    "want_watch_count",
-    "heat",
-)
-
-
 class MovieListItemResource(SchemaModel):
     # 影片主键：番号是对外主标识，但统一 action 协议的 resource_ids 收的是整数 id，
     # 所以影片卡片一律带上它，详情页与各列表页都能直接发起资源任务操作。
     id: int
-    javdb_id: str = Field()
+    javdb_id: str | None = None
+    metadata_source: dict[str, str | None] | None = None
     movie_number: str
     title: str
     series_id: int | None = None
@@ -89,8 +67,10 @@ class MovieListItemResource(SchemaModel):
     heat: int = 0
     is_collection: bool
     is_subscribed: bool
+    is_blacklisted: bool = False
     can_play: bool = False
-    is_4k: bool = False
+    media_count: int = 0
+    media_items: list[MediaSummaryResource] = Field(default_factory=list)
 
     @field_validator("release_date", mode="before")
     @classmethod
@@ -113,6 +93,7 @@ class MovieActorResource(SchemaModel):
     javdb_id: str = Field()
     name: str
     alias_name: str = Field()
+    display_name: str
     gender: int
     is_subscribed: bool = Field()
     profile_image: ImageResource | None = None
@@ -141,21 +122,22 @@ class MovieMediaPointResource(SchemaModel):
     image: ImageResource
 
 
-class MovieMediaResource(SchemaModel):
-    media_id: int = Field(validation_alias="id")
-    library_id: int | None = None
-    # 媒体所属库的 backend（local / cloud115），前端据此决定外部播放器是否走 HLS 代理。
-    library_backend: str | None = None
+class MovieMediaResource(MediaSummaryResource):
     play_url: str
-    storage_mode: str | None = None
-    resolution: str | None = None
-    file_size_bytes: int = 0
-    duration_seconds: int = 0
-    video_info: dict[str, Any] | None = None
-    special_tags: str = "普通"
-    valid: bool = True
+    playback_deliveries: list[Literal["proxy", "redirect"]]
     progress: MovieMediaProgressResource | None = None
     points: list[MovieMediaPointResource] = Field(default_factory=list)
+
+
+class MovieMergePlaybackCandidateResource(SchemaModel):
+    library_id: int
+    library_name: str
+    provider_key: str
+    segment_count: int
+
+
+class MovieMergedPlaybackResource(SchemaModel):
+    play_url: str
 
 
 class MovieDetailResource(MovieListItemResource):
@@ -166,6 +148,9 @@ class MovieDetailResource(MovieListItemResource):
     director_name: str | None = None
     plot_images: list[ImageResource] = Field(default_factory=list)
     media_items: list[MovieMediaResource] = Field(default_factory=list)
+    merge_playback_candidates: list[MovieMergePlaybackCandidateResource] = Field(
+        default_factory=list
+    )
     playlists: list[PlaylistSummaryResource] = Field(default_factory=list)
 
 
@@ -189,6 +174,18 @@ class MovieNumberParseResponse(SchemaModel):
 
 
 class MovieJavdbSearchRequest(SchemaModel):
+    movie_number: str = Field(min_length=1)
+
+    @field_validator("movie_number")
+    @classmethod
+    def validate_movie_number(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("movie_number cannot be blank")
+        return normalized
+
+
+class MovieHeatRecomputeParams(SchemaModel):
     movie_number: str = Field(min_length=1)
 
     @field_validator("movie_number")
@@ -235,6 +232,21 @@ class MovieCollectionStatusResource(SchemaModel):
 
 class MovieSubscriptionBatchRequest(SchemaModel):
     movie_numbers: list[str] = Field(min_length=1)
+
+    @field_validator("movie_numbers")
+    @classmethod
+    def validate_movie_numbers(cls, value: list[str]) -> list[str]:
+        validated_numbers: list[str] = []
+        for movie_number in value:
+            normalized = (movie_number or "").strip()
+            if not normalized:
+                raise ValueError("movie_numbers item cannot be blank")
+            validated_numbers.append(normalized)
+        return validated_numbers
+
+
+class MovieBlacklistBatchRequest(SchemaModel):
+    movie_numbers: list[str] = Field(min_length=1, max_length=1000)
 
     @field_validator("movie_numbers")
     @classmethod

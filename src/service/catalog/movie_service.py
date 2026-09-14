@@ -13,20 +13,20 @@ from peewee import JOIN, fn
 from src.api.exception.errors import ApiError
 from src.common import (
     build_signed_media_url,
+    build_signed_merged_media_url,
     parse_movie_number_from_text,
 )
 from src.common.runtime_time import utc_now_for_db
 from src.common.service_helpers import (
     build_ordered_expressions,
     find_movie_by_number,
-    media_special_tag_match_expression,
     playable_exists_expression,
     require_record,
     resolve_sort_expression,
     with_movie_card_relations,
 )
-from src.metadata.factory import build_javdb_provider
 from src.metadata._providers.models import JavdbMovieReviewResource
+from src.metadata.factory import build_javdb_provider
 from src.metadata.provider import MetadataNotFoundError, MetadataRequestError
 from src.model import (
     Actor,
@@ -43,8 +43,15 @@ from src.model import (
     MovieTag,
     Tag,
 )
+from src.plugins.provider_protocol import (
+    MEDIA_PROVIDER_REGISTRY,
+    ProviderOperationError,
+    ProviderUnavailableError,
+)
 from src.schema.catalog.actors import ImageResource
 from src.schema.catalog.movies import (
+    MovieActorResource,
+    MovieBlacklistBatchRequest,
     MovieCollectionMarkResponse,
     MovieCollectionMarkType,
     MovieCollectionStatusResource,
@@ -55,21 +62,22 @@ from src.schema.catalog.movies import (
     MovieMediaPointResource,
     MovieMediaProgressResource,
     MovieMediaResource,
+    MovieMergedPlaybackResource,
+    MovieMergePlaybackCandidateResource,
     MovieNumberParseResponse,
     MovieNumberSource,
     MovieReviewSort,
-    MovieSpecialTagFilter,
     MovieSubscriptionBatchResponse,
     MovieSubscriptionSkippedItem,
     TagMatchMode,
     TagResource,
 )
 from src.schema.common.pagination import PageResponse
+from src.service.catalog.movie_list_media_service import attach_movie_list_media
+from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
+from src.service.catalog.movie_resolution_service import resolution_exists_expression
 from src.service.collections import PlaylistService
-
-from src.service.transfers.downloads.auto_subscribed.search_state_service import (
-    SubscribedMovieSearchStateService,
-)
+from src.service.playback.provider_helpers import library_handle_for, media_handle_for
 
 
 class MovieService:
@@ -78,6 +86,7 @@ class MovieService:
     # 批量订阅/取消订阅的跳过原因，前端按 movie_number 标注本次未处理的选择项。
     SUBSCRIPTION_SKIP_MOVIE_NOT_FOUND = "movie_not_found"
     SUBSCRIPTION_SKIP_HAS_MEDIA = "has_media"
+    SUBSCRIPTION_SKIP_BLACKLISTED = "blacklisted"
 
     MOVIE_LIST_NULLABLE_SORT_FIELDS = {"release_date", "subscribed_at"}
     MOVIE_LIST_SORT_FIELD_MAP = {
@@ -92,21 +101,6 @@ class MovieService:
 
     _playable_exists_expression = staticmethod(playable_exists_expression)
 
-    @staticmethod
-    def _media_exists_expression(*conditions):
-        media_query = Media.select(Media.id).where(
-            Media.movie == Movie.movie_number,
-            *conditions,
-        )
-        return fn.EXISTS(media_query)
-
-    @classmethod
-    def _special_tag_exists_expression(cls, media_tag: str):
-        return cls._media_exists_expression(
-            Media.valid == True,
-            media_special_tag_match_expression(media_tag),
-        )
-
     @classmethod
     def _filtered_movies(
         cls,
@@ -116,13 +110,14 @@ class MovieService:
         year: int | None = None,
         status: MovieListStatus = MovieListStatus.ALL,
         collection_type: MovieCollectionType = MovieCollectionType.ALL,
-        special_tag: MovieSpecialTagFilter | None = None,
         series_id: int | None = None,
         director_name: str | None = None,
         maker_name: str | None = None,
         number_source: MovieNumberSource = MovieNumberSource.ALL,
         heat_min: int | None = None,
         heat_max: int | None = None,
+        resolution: str | None = None,
+        blacklisted: bool = False,
     ):
         """构建影片列表的基础筛选链路，供列表和计数查询复用。"""
         if heat_min is not None and heat_max is not None and heat_min > heat_max:
@@ -132,7 +127,7 @@ class MovieService:
                 "heat_min 不能大于 heat_max",
                 {"heat_min": heat_min, "heat_max": heat_max},
             )
-        query = Movie.select()
+        query = Movie.select().where(Movie.is_blacklisted == blacklisted)
         if actor_id is None:
             filtered_query = query
         else:
@@ -171,10 +166,6 @@ class MovieService:
 
         if collection_type == MovieCollectionType.SINGLE:
             filtered_query = filtered_query.where(Movie.is_collection == False)
-        if special_tag is not None:
-            filtered_query = filtered_query.where(
-                cls._special_tag_exists_expression(special_tag.to_media_tag())
-            )
         if series_id is not None:
             # 系列影片查询统一使用本地 movie_series.id，避免系列名变更导致匹配不稳定。
             filtered_query = filtered_query.where(Movie.series == series_id)
@@ -191,6 +182,10 @@ class MovieService:
             filtered_query = filtered_query.where(Movie.heat >= heat_min)
         if heat_max is not None:
             filtered_query = filtered_query.where(Movie.heat <= heat_max)
+        if resolution is not None:
+            filtered_query = filtered_query.where(
+                resolution_exists_expression(resolution, error_code="invalid_movie_filter")
+            )
         return filtered_query
 
     @staticmethod
@@ -230,7 +225,6 @@ class MovieService:
         year: int | None = None,
         status: MovieListStatus = MovieListStatus.ALL,
         collection_type: MovieCollectionType = MovieCollectionType.ALL,
-        special_tag: MovieSpecialTagFilter | None = None,
         sort: str | None = None,
         series_id: int | None = None,
         director_name: str | None = None,
@@ -238,10 +232,11 @@ class MovieService:
         number_source: MovieNumberSource = MovieNumberSource.ALL,
         heat_min: int | None = None,
         heat_max: int | None = None,
+        resolution: str | None = None,
+        blacklisted: bool = False,
     ):
         """列表查询统一在这里补齐封面图和 ``can_play`` 计算列。"""
         can_play_expression = cls._playable_exists_expression().alias("can_play")
-        is_4k_expression = cls._special_tag_exists_expression("4K").alias("is_4k")
         query, _thin_cover_alias = with_movie_card_relations(
             cls._filtered_movies(
                 actor_id=actor_id,
@@ -250,14 +245,15 @@ class MovieService:
                 year=year,
                 status=status,
                 collection_type=collection_type,
-                special_tag=special_tag,
                 series_id=series_id,
                 director_name=director_name,
                 maker_name=maker_name,
                 number_source=number_source,
                 heat_min=heat_min,
                 heat_max=heat_max,
-            ).select(Movie, can_play_expression, is_4k_expression)
+                resolution=resolution,
+                blacklisted=blacklisted,
+            ).select(Movie, can_play_expression)
         )
         return query.order_by(*cls._build_movie_list_sort(sort, status))
 
@@ -265,12 +261,12 @@ class MovieService:
     def _latest_movies_query(cls):
         """按最近导入媒体时间倒序列出影片，而不是按影片自身创建时间。"""
         can_play_expression = cls._playable_exists_expression().alias("can_play")
-        is_4k_expression = cls._special_tag_exists_expression("4K").alias("is_4k")
         latest_media_created_at = fn.MAX(Media.created_at)
         query, thin_cover_alias = with_movie_card_relations(
-            Movie.select(Movie, can_play_expression, is_4k_expression)
+            Movie.select(Movie, can_play_expression)
             .join(Media)
             .switch(Movie)
+            .where(Movie.is_blacklisted == False)
         )
         return (
             query
@@ -282,9 +278,8 @@ class MovieService:
     def _subscribed_actor_latest_movies_query(cls):
         """列出至少关联一位已订阅演员的影片，按上映日期倒序。"""
         can_play_expression = cls._playable_exists_expression().alias("can_play")
-        is_4k_expression = cls._special_tag_exists_expression("4K").alias("is_4k")
         query, thin_cover_alias = with_movie_card_relations(
-            Movie.select(Movie, can_play_expression, is_4k_expression)
+            Movie.select(Movie, can_play_expression)
             .join(MovieActor, JOIN.INNER, on=(MovieActor.movie == Movie.id))
             .join(Actor, JOIN.INNER, on=(MovieActor.actor == Actor.id))
             .switch(Movie)
@@ -337,14 +332,40 @@ class MovieService:
         )
 
     @staticmethod
-    def _actors(movie: Movie) -> list[Actor]:
-        return list(
-            Actor.select(Actor, Image)
+    def _actors(movie: Movie) -> list[MovieActorResource]:
+        profile_image_override = Image.alias()
+        actors = list(
+            Actor.select(Actor, Image, profile_image_override)
             .join(Image, JOIN.LEFT_OUTER, on=(Actor.profile_image == Image.id))
+            .switch(Actor)
+            .join(
+                profile_image_override,
+                JOIN.LEFT_OUTER,
+                on=(Actor.profile_image_override == profile_image_override.id),
+                attr="profile_image_override",
+            )
+            .switch(Actor)
             .join(MovieActor, JOIN.INNER, on=(MovieActor.actor == Actor.id))
             .where(MovieActor.movie == movie)
             .order_by(Actor.id)
         )
+        return [
+            MovieActorResource(
+                id=actor.id,
+                javdb_id=actor.javdb_id,
+                name=actor.name,
+                alias_name=actor.alias_name,
+                display_name=actor.display_name,
+                gender=actor.gender,
+                is_subscribed=actor.is_subscribed,
+                profile_image=(
+                    ImageResource.from_attributes_model(actor.effective_profile_image)
+                    if actor.effective_profile_image is not None
+                    else None
+                ),
+            )
+            for actor in actors
+        ]
 
     @staticmethod
     def _plot_images(movie: Movie) -> list[Image]:
@@ -359,8 +380,6 @@ class MovieService:
     @staticmethod
     def _media_items(movie: Movie) -> list[MovieMediaResource]:
         """把媒体、播放进度和打点信息折叠成详情页需要的资源结构。"""
-        from src.service.playback.media_service import MediaService
-
         media_items = list(
             Media.select(Media, MediaLibrary)
             .join(MediaLibrary, JOIN.LEFT_OUTER)
@@ -410,21 +429,101 @@ class MovieService:
                     last_watched_at=progress.last_watched_at,
                 )
             media.points = points_by_media_id.get(media.id, [])
-            media.play_url = build_signed_media_url(media.id)
-            media.library_backend = (
-                "cloud115"
-                if MediaService.is_cloud115_media(media)
-                else ("local" if media.library_id is not None else None)
+            bundle = MEDIA_PROVIDER_REGISTRY.require(media.library.provider_key)
+            media.play_url = build_signed_media_url(
+                media.id, delivery=bundle.playback_deliveries[0]
             )
+            media.library_name = media.library.name
+            media.provider_key = media.library.provider_key
+            media.playback_deliveries = list(bundle.playback_deliveries)
             resources.append(MovieMediaResource.from_attributes_model(media))
         return resources
 
     @staticmethod
+    def _merge_playback_groups(
+        movie: Movie,
+    ) -> list[tuple[MediaLibrary, list[Media], str]]:
+        media_items = list(
+            Media.select(Media, MediaLibrary)
+            .join(MediaLibrary)
+            .where(Media.movie == movie)
+            .order_by(Media.id)
+        )
+        groups: dict[int, tuple[MediaLibrary, list[Media]]] = {}
+        for media in media_items:
+            library = media.library
+            entry = groups.get(library.id)
+            if entry is None:
+                groups[library.id] = (library, [media])
+            else:
+                entry[1].append(media)
+
+        playable_groups: list[tuple[MediaLibrary, list[Media], str]] = []
+        for library_id in sorted(groups):
+            library, medias = groups[library_id]
+            # 合并播放表示同库的完整分段集合；任一段失效时不能悄悄跳过它。
+            if len(medias) < 2 or any(not media.valid for media in medias):
+                continue
+            bundle = MEDIA_PROVIDER_REGISTRY.require(library.provider_key)
+            playback_format = getattr(bundle, "merged_playback_format", None)
+            if playback_format not in {"mp4", "hls"}:
+                continue
+            playable_groups.append((library, medias, playback_format))
+        return playable_groups
+
+    @classmethod
+    def _merge_playback_candidates(
+        cls, movie: Movie
+    ) -> list[MovieMergePlaybackCandidateResource]:
+        return [
+            MovieMergePlaybackCandidateResource(
+                library_id=library.id,
+                library_name=library.name,
+                provider_key=library.provider_key,
+                segment_count=len(medias),
+            )
+            for library, medias, _playback_format in cls._merge_playback_groups(movie)
+        ]
+
+    @classmethod
+    def get_merged_playback(
+        cls, movie_number: str, library_id: int
+    ) -> MovieMergedPlaybackResource:
+        movie = cls._require_movie(movie_number)
+        for library, medias, playback_format in cls._merge_playback_groups(movie):
+            if library.id != library_id:
+                continue
+            try:
+                storage = MEDIA_PROVIDER_REGISTRY.storage_for(library_handle_for(library))
+                preflight_merged_playback = getattr(storage, "preflight_merged_playback", None)
+                if callable(preflight_merged_playback):
+                    preflight_merged_playback(
+                        medias=tuple(media_handle_for(media) for media in medias)
+                    )
+            except ProviderUnavailableError as exc:
+                raise ApiError(503, "provider_not_installed", "媒体提供方未安装") from exc
+            except ProviderOperationError as exc:
+                status_code = {
+                    "source_not_found": 404,
+                    "authentication_failed": 401,
+                    "unavailable": 503,
+                    "invalid_config": 422,
+                    "unsupported": 422,
+                }[exc.code]
+                raise ApiError(status_code, f"provider_{exc.code}", exc.safe_message) from exc
+            resource_path = "stream.mp4" if playback_format == "mp4" else "index.m3u8"
+            return MovieMergedPlaybackResource(
+                play_url=build_signed_merged_media_url(
+                    (media.id for media in medias), resource_path
+                ),
+            )
+        raise ApiError(422, "merged_playback_unavailable", "该媒体库不支持合并播放")
+
+    @staticmethod
     def get_movie_detail(movie_number: str) -> MovieDetailResource:
         """组装影片详情页所需的所有关联资源。"""
-        is_4k_expression = MovieService._special_tag_exists_expression("4K").alias("is_4k")
         query, _thin_cover_alias = with_movie_card_relations(
-            Movie.select(Movie, is_4k_expression)
+            Movie.select(Movie)
         )
         movie = (
             query
@@ -444,6 +543,8 @@ class MovieService:
         movie.tags = tags
         movie.plot_images = MovieService._plot_images(movie)
         movie.media_items = MovieService._media_items(movie)
+        movie.media_count = len(movie.media_items)
+        movie.merge_playback_candidates = MovieService._merge_playback_candidates(movie)
         movie.playlists = PlaylistService.list_movie_playlists(movie)
         movie.can_play = any(media_item.valid for media_item in movie.media_items)
         return MovieDetailResource.from_attributes_model(movie)
@@ -456,13 +557,14 @@ class MovieService:
         year: int | None = None,
         status: MovieListStatus = MovieListStatus.ALL,
         collection_type: MovieCollectionType = MovieCollectionType.ALL,
-        special_tag: MovieSpecialTagFilter | None = None,
         number_source: MovieNumberSource = MovieNumberSource.ALL,
         sort: str | None = None,
         director_name: str | None = None,
         maker_name: str | None = None,
         heat_min: int | None = None,
         heat_max: int | None = None,
+        resolution: str | None = None,
+        blacklisted: bool = False,
         page: int = 1,
         page_size: int = 20,
     ) -> PageResponse[MovieListItemResource]:
@@ -474,12 +576,13 @@ class MovieService:
             year=year,
             status=status,
             collection_type=collection_type,
-            special_tag=special_tag,
             director_name=director_name,
             maker_name=maker_name,
             number_source=number_source,
             heat_min=heat_min,
             heat_max=heat_max,
+            resolution=resolution,
+            blacklisted=blacklisted,
         ).count()
         movies = list(
             MovieService.movie_list_query(
@@ -489,15 +592,17 @@ class MovieService:
                 year=year,
                 status=status,
                 collection_type=collection_type,
-                special_tag=special_tag,
                 sort=sort,
                 director_name=director_name,
                 maker_name=maker_name,
                 number_source=number_source,
                 heat_min=heat_min,
                 heat_max=heat_max,
+                resolution=resolution,
+                blacklisted=blacklisted,
             ).offset(start).limit(page_size)
         )
+        attach_movie_list_media(movies)
         return PageResponse[MovieListItemResource](
             items=MovieListItemResource.from_items(movies),
             page=page,
@@ -519,6 +624,7 @@ class MovieService:
             .offset(start)
             .limit(page_size)
         )
+        attach_movie_list_media(movies)
         return PageResponse[MovieListItemResource](
             items=MovieListItemResource.from_items(movies),
             page=page,
@@ -534,6 +640,7 @@ class MovieService:
         start = max(page - 1, 0) * page_size
         total = Movie.select(Movie.id).join(Media).group_by(Movie.id).count()
         movies = list(MovieService._latest_movies_query().offset(start).limit(page_size))
+        attach_movie_list_media(movies)
         return PageResponse[MovieListItemResource](
             items=MovieListItemResource.from_items(movies),
             page=page,
@@ -551,6 +658,7 @@ class MovieService:
         movies = list(
             MovieService._subscribed_actor_latest_movies_query().offset(start).limit(page_size)
         )
+        attach_movie_list_media(movies)
         return PageResponse[MovieListItemResource](
             items=MovieListItemResource.from_items(movies),
             page=page,
@@ -583,6 +691,7 @@ class MovieService:
         if movie is None:
             return []
         movies = list(cls.movie_list_query().where(Movie.id == movie.id))
+        attach_movie_list_media(movies)
         return MovieListItemResource.from_items(movies)
 
     @classmethod
@@ -634,18 +743,14 @@ class MovieService:
             )
 
         target_is_collection = collection_type == MovieCollectionMarkType.COLLECTION
-        # 手工批量标记后写入 override 标识，后续自动规则同步不再覆盖这些影片。
-        (
-            Movie.update(
-                is_collection=target_is_collection,
-                is_collection_overridden=True,
-            )
-            .where(Movie.id.in_(matched_movie_ids))
-            .execute()
+        # 人工标记取得宿主 owner，后续自动规则尊重该字段；不增加单独 override 状态。
+        updated_count = MovieOwnershipGateway.update_host_manual(
+            matched_movie_ids,
+            {"is_collection": target_is_collection},
         )
         return MovieCollectionMarkResponse(
             requested_count=requested_count,
-            updated_count=len(matched_movie_ids),
+            updated_count=updated_count,
         )
 
     @classmethod
@@ -658,6 +763,8 @@ class MovieService:
     ) -> list[JavdbMovieReviewResource]:
         movie = cls._require_movie(movie_number)
         sort_value = sort.value if isinstance(sort, MovieReviewSort) else str(sort)
+        if not movie.javdb_id:
+            return []
         try:
             return build_javdb_provider().get_movie_reviews_by_javdb_id(
                 movie.javdb_id,
@@ -686,31 +793,61 @@ class MovieService:
                 },
             ) from exc
 
-    @staticmethod
-    def _reset_search_state_for_new_subscriptions(movie_ids: list[int]) -> None:
-        """未订阅 -> 订阅的影片要清掉上一轮订阅遗留的资源查询状态。
-
-        取消订阅不会删这些状态行，所以一部曾被判 exhausted 的影片重新订阅后，状态行还是
-        exhausted，自动下载任务会直接跳过它——用户侧表现为"重新订阅了却完全没动静"。
-        """
-        if not movie_ids:
-            return
-        SubscribedMovieSearchStateService.reset(movie_ids)
-
     @classmethod
     def set_subscription(cls, movie_number: str, subscribed: bool) -> None:
         movie = cls._require_movie(movie_number)
+        if subscribed and movie.is_blacklisted:
+            raise ApiError(
+                409,
+                "movie_is_blacklisted",
+                "影片已在黑名单中，请先解除黑名单",
+                {"movie_number": movie.movie_number},
+            )
         was_subscribed = bool(movie.is_subscribed)
         movie.is_subscribed = subscribed
+        reset_search_state = False
         if subscribed:
             if not was_subscribed or movie.subscribed_at is None:
                 movie.subscribed_at = utc_now_for_db()
+                reset_search_state = True
         else:
             movie.subscribed_at = None
+        if reset_search_state:
+            cls._reset_subscription_search_state(movie)
         # 窄更新：受保护字段白名单开放后裸 save() 会被护栏拒绝，订阅状态与标题无关。
-        movie.save(only=[Movie.is_subscribed, Movie.subscribed_at])
-        if subscribed and not was_subscribed:
-            cls._reset_search_state_for_new_subscriptions([movie.id])
+        movie.save(
+            only=[
+                Movie.is_subscribed,
+                Movie.subscribed_at,
+                *cls._subscription_search_state_fields(),
+            ]
+        )
+
+    @staticmethod
+    def _subscription_search_state_fields() -> tuple:
+        return (
+            Movie.subscription_search_state,
+            Movie.subscription_search_attempt_count,
+            Movie.subscription_search_retry_round,
+            Movie.subscription_search_last_attempted_at,
+            Movie.subscription_search_last_succeeded_at,
+            Movie.subscription_search_next_retry_at,
+            Movie.subscription_search_error_code,
+            Movie.subscription_search_last_error,
+            Movie.subscription_search_last_error_at,
+        )
+
+    @staticmethod
+    def _reset_subscription_search_state(movie: Movie) -> None:
+        movie.subscription_search_state = "pending"
+        movie.subscription_search_attempt_count = 0
+        movie.subscription_search_retry_round = (movie.subscription_search_retry_round or 0) + 1
+        movie.subscription_search_last_attempted_at = None
+        movie.subscription_search_last_succeeded_at = None
+        movie.subscription_search_next_retry_at = None
+        movie.subscription_search_error_code = None
+        movie.subscription_search_last_error = None
+        movie.subscription_search_last_error_at = None
 
     @classmethod
     def unsubscribe_movie(cls, movie_number: str) -> None:
@@ -753,6 +890,41 @@ class MovieService:
         return ordered_keys, display_by_key
 
     @classmethod
+    def set_blacklisted(
+        cls,
+        payload: MovieBlacklistBatchRequest,
+        *,
+        blacklisted: bool,
+    ) -> None:
+        ordered_keys, display_by_key = cls._dedup_movie_number_keys(payload.movie_numbers)
+        with Movie._meta.database.atomic():
+            movies = list(
+                Movie.select().where(fn.UPPER(Movie.movie_number).in_(ordered_keys))
+                .order_by(Movie.id).for_update()
+            )
+            matched_keys = {movie.movie_number.strip().upper() for movie in movies}
+            missing = [display_by_key[key] for key in ordered_keys if key not in matched_keys]
+            if missing:
+                raise ApiError(
+                    404,
+                    "movie_not_found",
+                    "影片不存在",
+                    {"movie_numbers": missing},
+                )
+            if blacklisted:
+                subscribed = [movie.movie_number for movie in movies if movie.is_subscribed]
+                if subscribed:
+                    raise ApiError(
+                        409,
+                        "movie_is_subscribed",
+                        "已订阅影片不能加入黑名单，请先取消订阅",
+                        {"movie_numbers": subscribed},
+                    )
+            MovieOwnershipGateway.update_host_manual(
+                [movie.id for movie in movies], {"is_blacklisted": blacklisted}
+            )
+
+    @classmethod
     def batch_set_subscription(
         cls, movie_numbers: list[str]
     ) -> MovieSubscriptionBatchResponse:
@@ -779,17 +951,31 @@ class MovieService:
             if key not in matched_keys
         ]
 
-        newly_subscribed_ids: list[int] = []
+        blacklisted_movies = [movie for movie in matched_movies if movie.is_blacklisted]
+        skipped.extend(
+            MovieSubscriptionSkippedItem(
+                movie_number=movie.movie_number,
+                reason=cls.SUBSCRIPTION_SKIP_BLACKLISTED,
+            )
+            for movie in blacklisted_movies
+        )
+
         for movie in matched_movies:
+            if movie.is_blacklisted:
+                continue
             # 与单条 set_subscription(True) 一致：仅在原本未订阅或订阅时间为空时写入当前时间。
             was_subscribed = bool(movie.is_subscribed)
             movie.is_subscribed = True
             if not was_subscribed or movie.subscribed_at is None:
                 movie.subscribed_at = utc_now_for_db()
-            movie.save(only=[Movie.is_subscribed, Movie.subscribed_at])
-            if not was_subscribed:
-                newly_subscribed_ids.append(movie.id)
-        cls._reset_search_state_for_new_subscriptions(newly_subscribed_ids)
+                cls._reset_subscription_search_state(movie)
+            movie.save(
+                only=[
+                    Movie.is_subscribed,
+                    Movie.subscribed_at,
+                    *cls._subscription_search_state_fields(),
+                ]
+            )
 
         return MovieSubscriptionBatchResponse(
             requested_count=requested_count,

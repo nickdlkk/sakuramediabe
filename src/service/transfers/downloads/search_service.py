@@ -21,6 +21,7 @@ class DownloadSearchService:
         *,
         movie_number: str,
         indexer_kind: str | None = None,
+        download_client_id: int | None = None,
     ) -> list[DownloadCandidateResource]:
         normalized_movie_number = validate_non_empty(
             movie_number,
@@ -29,7 +30,12 @@ class DownloadSearchService:
         ).upper()
         normalized_kind = self._validate_indexer_kind(indexer_kind)
         try:
-            candidates = self.torznab_client.search(normalized_movie_number, normalized_kind)
+            candidates = self.torznab_client.search(
+                normalized_movie_number,
+                normalized_kind,
+                download_client_id=download_client_id,
+                continue_on_error=True,
+            )
         except TorznabClientError as exc:
             raise ApiError(
                 502,

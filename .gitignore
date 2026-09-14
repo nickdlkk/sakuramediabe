@@ -1,5 +1,6 @@
 *.pyc
 config.toml
+src/config/telemetry.json
 .DS_Store
 server/lib
 *.db
@@ -11,7 +12,6 @@ docs/others
 test_media_source_dir
 .pytest_cache
 .testmondata*
-lib/joytag
 logs
 docker-data
 compose.yaml
@@ -26,7 +26,6 @@ docs/development
 .codex
 .codegraph
 AGENTS.md
-
 # 本地测试库连接串（含账号密码），只保留脱敏模板 .env.test.example
 .env.test
 

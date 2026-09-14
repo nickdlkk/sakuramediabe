@@ -18,7 +18,6 @@ from src.model import (
     PLAYLIST_KIND_RECENTLY_PLAYED,
     Actor,
     DailyRecommendationItem,
-    HotReviewItem,
     Movie,
     MovieActor,
     Playlist,
@@ -29,6 +28,7 @@ from src.model import (
 from src.schema.catalog.movies import MovieListItemResource
 from src.schema.common.pagination import PageResponse
 from src.schema.discovery import DailyRecommendationMovieResource
+from src.service.catalog.movie_list_media_service import attach_movie_list_media
 from src.service.discovery.qdrant_movie_similarity_store import (
     MovieSimilarityIndexError,
 )
@@ -40,18 +40,16 @@ SIMILARITY_PER_SEED_LIMIT = 50
 RANK_DECAY_WINDOW = 100
 
 REGULAR_WEIGHTS = {
-    "similarity": 0.40,
-    "subscribed_actor": 0.15,
-    "subscribed_movie": 0.10,
-    "heat": 0.20,
-    "ranking": 0.10,
-    "hot_review": 0.05,
+    "similarity": 8 / 19,
+    "subscribed_actor": 3 / 19,
+    "subscribed_movie": 2 / 19,
+    "heat": 4 / 19,
+    "ranking": 2 / 19,
 }
 COLD_START_WEIGHTS = {
-    "heat": 0.55,
-    "ranking": 0.25,
-    "hot_review": 0.10,
-    "freshness": 0.10,
+    "heat": 11 / 18,
+    "ranking": 5 / 18,
+    "freshness": 2 / 18,
 }
 
 REASON_TEXTS = {
@@ -60,7 +58,6 @@ REASON_TEXTS = {
     "subscribed_movie": "你已订阅这部影片",
     "popular_movie": "近期热度较高",
     "ranking_trending": "来自近期榜单",
-    "hot_review": "近期热评活跃",
     "new_release": "较新发布或近期入库",
 }
 
@@ -72,7 +69,7 @@ class _CandidateMovie:
     评分与落库只用 id / heat / release_date / created_at。
     """
 
-    __slots__ = ("id", "heat", "release_date", "created_at", "is_subscribed")
+    __slots__ = ("created_at", "heat", "id", "is_subscribed", "release_date")
 
     def __init__(
         self,
@@ -142,7 +139,7 @@ class DailyRecommendationService:
                 Movie.created_at,
                 Movie.is_subscribed,
             )
-            .where(Movie.is_collection == False)
+            .where(Movie.is_collection == False, Movie.is_blacklisted == False)
             .order_by(Movie.id.asc())
         )
         return [
@@ -237,18 +234,6 @@ class DailyRecommendationService:
         return dict(scores)
 
     @classmethod
-    def _load_hot_review_scores(cls, candidate_ids: set[int]) -> dict[int, float]:
-        if not candidate_ids:
-            return {}
-        rows = HotReviewItem.select(HotReviewItem.movie, HotReviewItem.rank).where(
-            HotReviewItem.movie.in_(candidate_ids)
-        )
-        scores: dict[int, float] = defaultdict(float)
-        for row in rows:
-            scores[row.movie_id] = max(scores[row.movie_id], cls._rank_decay(int(row.rank or 0)))
-        return dict(scores)
-
-    @classmethod
     def _build_freshness_scores(cls, movies: Sequence[_CandidateMovie]) -> dict[int, float]:
         if not movies:
             return {}
@@ -274,7 +259,12 @@ class DailyRecommendationService:
         return [REASON_TEXTS[reason_code] for reason_code in reason_codes if reason_code in REASON_TEXTS]
 
     @classmethod
-    def _score_movies(cls, movies: Sequence[_CandidateMovie]) -> tuple[list[_ScoredRecommendation], dict[str, int | bool]]:
+    def _score_movies(
+        cls,
+        movies: Sequence[_CandidateMovie],
+        *,
+        progress_callback: Callable[[dict], None] | None = None,
+    ) -> tuple[list[_ScoredRecommendation], dict[str, int | bool]]:
         candidate_ids = {movie.id for movie in movies}
         recent_seed_ids = cls._load_recent_seed_ids(candidate_ids)
         subscribed_actor_movie_ids = cls._load_subscribed_actor_movie_ids(candidate_ids)
@@ -283,26 +273,25 @@ class DailyRecommendationService:
         similarity_scores = cls._load_similarity_scores(recent_seed_ids, candidate_ids)
         heat_scores = cls._load_heat_scores(movies)
         ranking_scores = cls._load_ranking_scores(candidate_ids)
-        hot_review_scores = cls._load_hot_review_scores(candidate_ids)
         freshness_scores = cls._build_freshness_scores(movies)
 
         has_interest_signal = bool(recent_seed_ids or subscribed_actor_movie_ids or subscribed_movie_ids)
         has_public_signal = any(
             score > 0
-            for score_map in (heat_scores, ranking_scores, hot_review_scores)
+            for score_map in (heat_scores, ranking_scores)
             for score in score_map.values()
         )
         extreme_cold_start = not has_interest_signal and not has_public_signal
 
         scored: list[_ScoredRecommendation] = []
-        for movie in movies:
+        progress_stride = max(1, len(movies) // 10)
+        for index, movie in enumerate(movies, start=1):
             signal_scores = {
                 "similarity": cls._normalize(similarity_scores.get(movie.id, 0.0)),
                 "subscribed_actor": 1.0 if movie.id in subscribed_actor_movie_ids else 0.0,
                 "subscribed_movie": 1.0 if movie.id in subscribed_movie_ids else 0.0,
                 "heat": cls._normalize(heat_scores.get(movie.id, 0.0)),
                 "ranking": cls._normalize(ranking_scores.get(movie.id, 0.0)),
-                "hot_review": cls._normalize(hot_review_scores.get(movie.id, 0.0)),
                 "freshness": cls._normalize(freshness_scores.get(movie.id, 0.0)),
             }
             if has_interest_signal:
@@ -323,12 +312,17 @@ class DailyRecommendationService:
                 reason_codes.append("popular_movie")
             if signal_scores["ranking"] > 0:
                 reason_codes.append("ranking_trending")
-            if signal_scores["hot_review"] > 0:
-                reason_codes.append("hot_review")
             if extreme_cold_start or (not has_interest_signal and signal_scores["freshness"] > 0):
                 reason_codes.append("new_release")
 
             scored.append(_ScoredRecommendation(movie, float(score), reason_codes, signal_scores))
+            if progress_callback is not None and index % progress_stride == 0:
+                emit_progress(
+                    progress_callback,
+                    current=index,
+                    total=len(movies),
+                    text=f"每日推荐快照生成 · 正在评分 {index}/{len(movies)}",
+                )
 
         scored.sort(
             key=lambda item: (
@@ -356,9 +350,35 @@ class DailyRecommendationService:
     ) -> dict[str, int | str | bool]:
         snapshot_date = cls._snapshot_date(target_date)
         safe_limit = max(int(limit), 0)
+        emit_progress(progress_callback, current=0, total=0, text="每日推荐快照生成 · 正在读取候选影片")
         movies = cls._load_candidate_movies()
-        scored, score_stats = cls._score_movies(movies)
+        emit_progress(
+            progress_callback,
+            current=0,
+            total=len(movies),
+            text=f"每日推荐快照生成 · 候选 {len(movies)} 部 · 正在评分",
+            summary_patch={"candidate_movies": len(movies)},
+        )
+        scored, score_stats = cls._score_movies(
+            movies, progress_callback=progress_callback
+        )
         ranked = scored[:safe_limit]
+
+        stats = {
+            "snapshot_date": snapshot_date.isoformat(),
+            "candidate_movies": int(score_stats["candidate_movies"]),
+            "stored_items": len(ranked),
+            "cold_start": bool(score_stats["cold_start"]),
+            "extreme_cold_start": bool(score_stats["extreme_cold_start"]),
+            "recent_seed_movies": int(score_stats["recent_seed_movies"]),
+        }
+        emit_progress(
+            progress_callback,
+            current=len(movies),
+            total=len(movies),
+            text=f"每日推荐快照生成 · 正在写入快照 · 入选 {len(ranked)} 部",
+            summary_patch=stats,
+        )
         generated_at = utc_now_for_db()
 
         with get_database().atomic():
@@ -381,15 +401,6 @@ class DailyRecommendationService:
             if rows:
                 DailyRecommendationItem.insert_many(rows).execute()
 
-        stats = {
-            "snapshot_date": snapshot_date.isoformat(),
-            "candidate_movies": int(score_stats["candidate_movies"]),
-            "stored_items": len(ranked),
-            "cold_start": bool(score_stats["cold_start"]),
-            "extreme_cold_start": bool(score_stats["extreme_cold_start"]),
-            "recent_seed_movies": int(score_stats["recent_seed_movies"]),
-        }
-        emit_progress(progress_callback, **stats)
         return stats
 
     @classmethod
@@ -402,9 +413,10 @@ class DailyRecommendationService:
         safe_page_size = int(page_size)
         validate_page(safe_page, safe_page_size, error_code="invalid_daily_recommendation_filter")
         start = (safe_page - 1) * safe_page_size
-        total = DailyRecommendationItem.select().count()
+        query = DailyRecommendationItem.select().join(Movie).where(Movie.is_blacklisted == False)
+        total = query.count()
         rows = list(
-            DailyRecommendationItem.select()
+            query
             .order_by(DailyRecommendationItem.rank.asc())
             .offset(start)
             .limit(safe_page_size)
@@ -419,8 +431,11 @@ class DailyRecommendationService:
 
         movie_ids = [row.movie_id for row in rows]
         movie_query, _thin_cover_alias = with_movie_card_relations(Movie.select(Movie))
-        movies_by_id = {movie.id: movie for movie in movie_query.where(Movie.id.in_(movie_ids))}
-        MovieRecommendationService._attach_movie_flags(list(movies_by_id.values()))
+        movies_by_id = {
+            movie.id: movie
+            for movie in movie_query.where(Movie.id.in_(movie_ids))
+        }
+        attach_movie_list_media(list(movies_by_id.values()))
         today = runtime_now().date()
 
         items: list[DailyRecommendationMovieResource] = []
@@ -430,7 +445,6 @@ class DailyRecommendationService:
                 continue
             base_resource = MovieListItemResource.from_attributes_model(movie)
             base_resource.can_play = bool(getattr(movie, "can_play", False))
-            base_resource.is_4k = bool(getattr(movie, "is_4k", False))
             items.append(
                 DailyRecommendationMovieResource.model_validate(
                     {

@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from pydantic import Field
+
 from src.schema.common.base import SchemaModel
 
 
@@ -13,6 +15,7 @@ class PluginSummaryResource(SchemaModel):
     enabled: bool
     load_status: str = "ok"
     load_error: str | None = None
+    release_api_url: str | None = None
 
 
 class PluginDetailResource(PluginSummaryResource):
@@ -33,6 +36,8 @@ class PluginSettingsResource(SchemaModel):
     """插件私有配置（`plugins.settings.<plugin_id>`）的明文快照。"""
 
     settings: dict[str, Any]
+    settings_schema: dict[str, Any] | None = Field(default=None, alias="schema")
+    defaults: dict[str, Any] | None = None
 
 
 class PluginSettingsUpdateResource(PluginSettingsResource):

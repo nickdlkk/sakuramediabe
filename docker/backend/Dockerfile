@@ -1,19 +1,17 @@
 # ── Stage 1: 安装 Python 依赖 ──
-FROM python:3.10-slim-bookworm AS builder
+FROM python:3.10-slim-bookworm@sha256:68d914ec641a0b69267ce65184d000a2bc3a9ee2590ab702b82250ab2385735a AS builder
 WORKDIR /build
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 # ── Stage 2: 运行时镜像 ──
-FROM python:3.10-slim-bookworm AS runtime
+FROM python:3.10-slim-bookworm@sha256:68d914ec641a0b69267ce65184d000a2bc3a9ee2590ab702b82250ab2385735a AS runtime
 WORKDIR /app
 
-ARG SAKURAMEDIA_BACKEND_VERSION=v0.0.1
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PUID=1000 \
-    PGID=1000 \
-    SAKURAMEDIA_BACKEND_VERSION=${SAKURAMEDIA_BACKEND_VERSION}
+    PGID=1000
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
@@ -43,7 +41,11 @@ RUN chmod +x /docker-entrypoint.sh \
 COPY docker/backend/supervisord.conf /etc/supervisor/supervisord.conf
 COPY src /app/src
 RUN chmod -R a+rX /app/src
-# 主服务只保留自身运行所需的数据目录，JoyTag 模型目录由独立推理服务管理。
+
+ARG SAKURAMEDIA_BACKEND_VERSION=v0.0.1
+ENV SAKURAMEDIA_BACKEND_VERSION=${SAKURAMEDIA_BACKEND_VERSION}
+
+# 主服务只保留自身运行所需的数据目录，嵌入模型由独立服务管理。
 VOLUME ["/data"]
 EXPOSE 8000 9001
 ENTRYPOINT ["/docker-entrypoint.sh"]

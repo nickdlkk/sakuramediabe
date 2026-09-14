@@ -37,13 +37,10 @@ class JavdbProvider(MetadataRequestClient):
     SUPPORTED_RANK_PERIODS = {"daily", "weekly", "monthly"}
     # 播放榜筛选：all=热播，high_score=高评分。
     SUPPORTED_PLAYBACK_FILTERS = {"all", "high_score"}
-    SUPPORTED_HOT_REVIEW_PERIODS = {
-        "weekly", "all", "quarterly", "monthly", "yearly"}
     API_PATH_MOVIES_TAGS = "/api/v1/movies/tags"
     API_PATH_SEARCH = "/api/v2/search"
     API_PATH_MOVIE_DETAIL = "/api/v4/movies/{javdb_id}"
     API_PATH_MOVIE_REVIEWS = "/api/v1/movies/{javdb_id}/reviews"
-    API_PATH_HOT_REVIEWS = "/api/v1/reviews/hotly"
     API_PATH_RANKINGS = "/api/v1/rankings"
     API_PATH_RANKINGS_PLAYBACK = "/api/v1/rankings/playback"
     API_PATH_SESSIONS = "/api/v1/sessions"
@@ -103,11 +100,6 @@ class JavdbProvider(MetadataRequestClient):
     API_PARAMS_MOVIE_REVIEWS = {
         "page": 1,
         "limit": 20,
-    }
-    API_PARAMS_HOT_REVIEWS = {
-        "period": "weekly",
-        "page": 1,
-        "limit": 24,
     }
 
     def __init__(
@@ -312,11 +304,7 @@ class JavdbProvider(MetadataRequestClient):
                 if target_actor is not None:
                     break
         if target_actor:
-            raw_gender = target_actor.get("gender")
-            if raw_gender is None:
-                gender = 0
-            else:
-                gender = int(not raw_gender)
+            gender = self._map_actor_gender(target_actor.get("gender"))
             logger.debug(
                 "Javdb actor matched actor_name={} actor_id={} actor_type={}",
                 actor_name,
@@ -360,8 +348,7 @@ class JavdbProvider(MetadataRequestClient):
             if not actor_id or actor_id in seen_actor_ids:
                 continue
             seen_actor_ids.add(actor_id)
-            raw_gender = actor.get("gender")
-            gender = 0 if raw_gender is None else int(not raw_gender)
+            gender = self._map_actor_gender(actor.get("gender"))
             resources.append(
                 JavdbMovieActorResource.model_validate(
                     {
@@ -488,48 +475,6 @@ class JavdbProvider(MetadataRequestClient):
         logger.debug(
             "Javdb get_movie_reviews_by_javdb_id success javdb_id={} page={} reviews={}",
             javdb_id,
-            page,
-            len(resources),
-        )
-        return resources
-
-    def get_hot_reviews(
-        self,
-        period: str = "weekly",
-        page: int = 1,
-        limit: int = 24,
-    ) -> list[JavdbMovieReviewResource]:
-        if period not in self.SUPPORTED_HOT_REVIEW_PERIODS:
-            raise ValueError(f"unsupported period: {period}")
-        if page < 1:
-            raise ValueError(f"invalid page: {page}")
-        if limit < 1:
-            raise ValueError(f"invalid limit: {limit}")
-
-        logger.debug(
-            "Javdb get_hot_reviews start period={} page={} limit={}",
-            period,
-            page,
-            limit,
-        )
-        payload, url = self._get_hot_reviews_payload(
-            period=period,
-            page=page,
-            limit=limit,
-        )
-        reviews = self._extract_movie_reviews(payload, url=url)
-        resources: list[JavdbMovieReviewResource] = []
-        for review in reviews:
-            if not isinstance(review, dict):
-                logger.warning(
-                    "Javdb hot review entry skipped because type is invalid value_type={}",
-                    type(review).__name__,
-                )
-                continue
-            resources.append(self._build_movie_review(review))
-        logger.debug(
-            "Javdb get_hot_reviews success period={} page={} reviews={}",
-            period,
             page,
             len(resources),
         )
@@ -816,42 +761,6 @@ class JavdbProvider(MetadataRequestClient):
             raise MetadataRequestError("GET", url, detail)
         return payload, url
 
-    def _get_hot_reviews_payload(
-        self,
-        *,
-        period: str,
-        page: int,
-        limit: int,
-    ) -> tuple[dict[str, Any], str]:
-        params: dict[str, Any] = {
-            **self.API_PARAMS_HOT_REVIEWS,
-        }
-        params["period"] = period
-        params["page"] = page
-        params["limit"] = limit
-        url = self._build_api_url(
-            path=self.API_PATH_HOT_REVIEWS,
-            query_params=params,
-        )
-        logger.debug(
-            "Javdb fetch hot reviews period={} page={} limit={} url={}",
-            period,
-            page,
-            limit,
-            url,
-        )
-        payload = self.request_json("GET", url)
-        if payload.get("success") != 1:
-            detail = payload.get(
-                "message") or f"unexpected success={payload.get('success')}"
-            logger.warning(
-                "Javdb hot reviews request returned unsuccessful payload period={} detail={}",
-                period,
-                detail,
-            )
-            raise MetadataRequestError("GET", url, detail)
-        return payload, url
-
     def _extract_movie_reviews(self, payload: dict[str, Any], *, url: str) -> list[Any]:
         data = payload.get("data")
         reviews = data.get("reviews") if isinstance(data, dict) else None
@@ -991,9 +900,13 @@ class JavdbProvider(MetadataRequestClient):
                 "extra": payload,
                 "actors": self._build_movie_actors(actors),
                 "tags": self._build_movie_tags(tags),
+                "actors_available": isinstance(movie.get("actors"), list),
+                "tags_available": isinstance(movie.get("tags"), list),
                 "plot_images": self._build_preview_images(preview_images),
             }
         )
+        detail.actors_available = detail.actors_available and len(detail.actors) == len(actors)
+        detail.tags_available = detail.tags_available and len(detail.tags) == len(tags)
         logger.debug(
             "Javdb movie detail mapped javdb_id={} movie_number={} actors={} tags={} plot_images={}",
             detail.javdb_id,
@@ -1025,12 +938,32 @@ class JavdbProvider(MetadataRequestClient):
                         "name": actor.get("name") or "",
                         "alias_names": self._collect_actor_candidate_names(actor),
                         "avatar_url": self._resolve_actor_avatar_url(actor),
-                        "gender": int(not actor.get("gender")),
+                        "gender": self._map_actor_gender(actor.get("gender")),
                     }
                 )
             )
         logger.debug("Javdb actor resources built count={}", len(resources))
         return resources
+
+    @staticmethod
+    def _map_actor_gender(raw_gender: Any) -> int:
+        """将 JavDB 性别值映射为本地枚举：未知 0、女性 1、男性 2。"""
+        if raw_gender is None:
+            return 0
+        if isinstance(raw_gender, str):
+            normalized_gender = raw_gender.strip().lower()
+            if normalized_gender in {"female", "女"}:
+                return 1
+            if normalized_gender in {"male", "男"}:
+                return 2
+            if normalized_gender not in {"0", "1"}:
+                return 0
+            raw_gender = int(normalized_gender)
+        if raw_gender == 0:
+            return 1
+        if raw_gender == 1:
+            return 2
+        return 0
 
     def _collect_actor_candidate_names(self, actor: dict[str, Any]) -> list[str]:
         candidate_names: list[str] = []

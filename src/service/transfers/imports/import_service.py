@@ -1,64 +1,58 @@
-"""媒体导入 service。
+"""Provider-neutral scan → stage → host write → finalize import pipeline."""
 
-顶层编排 ``import_from_source``：调 ``media_source_scanner`` 完成扫描分组、并发抓取远端元数据、
-再委托 ``media_import_writer`` 完成落库。ImportJob 状态维护与 DownloadTask 状态回写在这里收口。
-"""
+from __future__ import annotations
 
-import time
-from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import PurePosixPath
 from threading import RLock, local
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 from pydantic import BaseModel
 
-# 导入状态/失败原因的取值统一收口到 media_import_status 模块。
+from src.api.exception.errors import ApiError
+from src.common.media_formats import (
+    is_supported_video_file_name,
+    normalize_media_resolution,
+)
 from src.common.media_import_status import (
     FAILURE_REASON_IMAGE_DOWNLOAD_FAILED,
-    FAILURE_REASON_IMPORT_JOB_CRASHED,
-    FAILURE_REASON_MEDIA_IMPORT_FAILED,
     FAILURE_REASON_METADATA_FETCH_FAILED,
     FAILURE_REASON_METADATA_UPSERT_FAILED,
-    FAILURE_REASON_NO_MEDIA_FILES_FOUND,
-    FAILURE_REASON_RETRY_SOURCES_MISSING,
-    IMPORT_JOB_STATE_PENDING,
-    IMPORT_JOB_STATE_RUNNING,
-    IMPORT_STATUS_COMPLETED,
-    IMPORT_STATUS_FAILED,
-    IMPORT_STATUS_RUNNING,
     make_failure_item,
 )
+from src.common.movie_numbers import (
+    parse_movie_number_from_text,
+    subtitle_matches_movie_number,
+)
 from src.common.service_helpers import emit_progress
-from src.common.runtime_time import utc_now_for_db
-from src.config.config import settings
-from src.model import DownloadTask, ImportJob, MediaLibrary, Movie, get_database
-from src.model.enums import MediaLibraryBackend
-
-# 从子模块而非 src.service.catalog 包导入：走包会执行 catalog/__init__.py，而其中的
-# movie_subscription_service 又要导入 transfers 域，形成 catalog <-> transfers 的包级循环，
-# 逼得对面只能把所有 transfers 导入塞进函数体。指到具体文件即可绕开 __init__ 的连锁初始化。
+from src.metadata.provider import MetadataNotFoundError, MetadataRequestError
+from src.model import Media, MediaLibrary, Movie, VideoItem, get_database
+from src.plugins.provider_protocol import (
+    MEDIA_PROVIDER_REGISTRY,
+    ImportFile,
+    ImportFileContent,
+    ImportPlacement,
+    ProviderOperationError,
+    ProviderUnavailableError,
+    StagedMedia,
+)
+from src.schema.catalog.subtitles import SubtitleImportStatus
+from src.schema.transfers.media_import import ImportResult
 from src.service.catalog.catalog_import_service import CatalogImportService
 from src.service.catalog.movie_image_service import ImageDownloadError
-from src.service.playback.media_metadata_probe_service import MediaMetadataProbeService
-
-from src.service.transfers.shared.file_transfer import delete_source_files
-from src.service.transfers.shared.import_job_state import finalize_import_job
-from src.service.transfers.imports.writer import import_single_scanned_file
-from src.service.transfers.imports.source_scanner import (
-    ImportTransferMode,
-    find_media_library_containing_path,
-    scan_source_files,
-)
+from src.service.catalog.subtitle_asset_service import SubtitleAssetService
+from src.service.playback.provider_helpers import media_handle_for
+from src.service.transfers.downloads.common import library_handle_for
+from src.service.videos.video_cover_service import VideoCoverService
 
 ImportProgressCallback = Callable[[dict[str, object]], None]
 
 
 class MetadataImportResult(BaseModel):
-    """并发抓取远端元数据后的单条结果。"""
-
     movie_number: str
     movie_id: int | None = None
     failure_reason: str | None = None
@@ -66,65 +60,42 @@ class MetadataImportResult(BaseModel):
 
 
 class MediaImportService:
-    """把待导入目录中的视频文件转换为本地媒体库记录。"""
+    """Import opaque provider refs without reading provider paths in the host."""
 
     def __init__(
         self,
         provider: Any | None = None,
-        image_downloader: Callable[[str, Path], None] | None = None,
-        now_ms: Callable[[], int] | None = None,
+        image_downloader: Callable[[str, Any], None] | None = None,
         catalog_import_service: CatalogImportService | None = None,
-        media_metadata_probe_service: MediaMetadataProbeService | None = None,
     ):
+        self._provider_override = provider
         self.image_downloader = image_downloader
-        self.now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._catalog_persist_lock = RLock()
-        self._worker_local = local()
-        self._provider_factory = None if provider is not None else self._create_provider
-        self._catalog_import_service_factory = (
-            None if catalog_import_service is not None else self._create_catalog_import_service
-        )
-        self.media_metadata_probe_service = media_metadata_probe_service or MediaMetadataProbeService()
-        self.provider = provider or self._create_provider()
-        self.catalog_import_service = catalog_import_service or self._create_catalog_import_service()
-        logger.info(
-            "MediaImportService initialized javdb_host={} image_root={}",
-            settings.metadata.javdb_host,
-            settings.media.import_image_root_path,
-        )
-
-    def _create_provider(self):
-        from src.metadata.factory import build_javdb_provider
-
-        return build_javdb_provider()
-
-    def _create_catalog_import_service(self) -> CatalogImportService:
-        return CatalogImportService(
-            image_downloader=self.image_downloader,
+        self.catalog_import_service = catalog_import_service or CatalogImportService(
+            image_downloader=image_downloader,
             persist_lock=self._catalog_persist_lock,
         )
+        self._worker_local = local()
+
+    def _storage(self, library: MediaLibrary):
+        if self._provider_override is not None:
+            return self._provider_override
+        try:
+            return MEDIA_PROVIDER_REGISTRY.storage_for(library_handle_for(library))
+        except ProviderUnavailableError as exc:
+            raise ApiError(
+                503,
+                "provider_not_installed",
+                "媒体提供方未安装",
+                {"provider_key": library.provider_key},
+            ) from exc
+        except ProviderOperationError as exc:
+            raise self._provider_error(exc) from exc
 
     def _metadata_max_workers(self, total_movies: int) -> int:
-        configured_workers = max(1, settings.metadata.import_metadata_max_workers)
-        return min(configured_workers, total_movies)
+        from src.config.config import settings
 
-    def _get_worker_provider(self):
-        if self._provider_factory is None:
-            return self.provider
-        provider = getattr(self._worker_local, "provider", None)
-        if provider is None:
-            provider = self._provider_factory()
-            self._worker_local.provider = provider
-        return provider
-
-    def _get_worker_catalog_import_service(self):
-        if self._catalog_import_service_factory is None:
-            return self.catalog_import_service
-        catalog_import_service = getattr(self._worker_local, "catalog_import_service", None)
-        if catalog_import_service is None:
-            catalog_import_service = self._catalog_import_service_factory()
-            self._worker_local.catalog_import_service = catalog_import_service
-        return catalog_import_service
+        return min(max(1, settings.metadata.import_metadata_max_workers), total_movies)
 
     def _ensure_worker_database_ready(self) -> None:
         database = get_database()
@@ -133,48 +104,42 @@ class MediaImportService:
 
     def _import_movie_metadata(self, movie_number: str) -> MetadataImportResult:
         self._ensure_worker_database_ready()
-        provider = self._get_worker_provider()
-        catalog_import_service = self._get_worker_catalog_import_service()
+        provider = getattr(self._worker_local, "metadata_provider", None)
+        if provider is None:
+            from src.metadata.factory import build_javdb_provider
 
+            provider = build_javdb_provider()
+            self._worker_local.metadata_provider = provider
         try:
-            detail = provider.get_movie_by_number(movie_number)
-        except Exception as exc:
+            from src.service.catalog.metadata_source_service import (
+                MetadataSourceError,
+                MetadataSourceService,
+            )
+
+            movie, _created = MetadataSourceService.import_by_number(
+                movie_number, provider, self.catalog_import_service, force_subscribed=True
+            )
+        except (MetadataNotFoundError, MetadataRequestError, MetadataSourceError) as exc:
             logger.warning("Import metadata fetch failed movie_number={} detail={}", movie_number, exc)
             return MetadataImportResult(
                 movie_number=movie_number,
                 failure_reason=FAILURE_REASON_METADATA_FETCH_FAILED,
                 failure_detail=str(exc),
             )
-
-        try:
-            movie, _created = catalog_import_service.import_movie_if_missing(
-                detail,
-                force_subscribed=True,
-            )
         except ImageDownloadError as exc:
-            logger.warning("Import image download failed movie_number={} detail={}", movie_number, exc)
             return MetadataImportResult(
                 movie_number=movie_number,
                 failure_reason=FAILURE_REASON_IMAGE_DOWNLOAD_FAILED,
                 failure_detail=str(exc),
             )
         except Exception as exc:
-            logger.exception("Import metadata upsert failed movie_number={} detail={}", movie_number, exc)
+            logger.exception("Import metadata upsert failed movie_number={}", movie_number)
             return MetadataImportResult(
                 movie_number=movie_number,
                 failure_reason=FAILURE_REASON_METADATA_UPSERT_FAILED,
                 failure_detail=str(exc),
             )
-
-        logger.info(
-            "Import metadata upsert success movie_number={} movie_id={}",
-            movie_number,
-            movie.id,
-        )
-        return MetadataImportResult(
-            movie_number=movie_number,
-            movie_id=movie.id,
-        )
+        return MetadataImportResult(movie_number=movie_number, movie_id=movie.id)
 
     @contextmanager
     def metadata_import_batch(
@@ -182,8 +147,7 @@ class MediaImportService:
         movie_numbers: Sequence[str],
         *,
         thread_name_prefix: str = "import-metadata",
-    ) -> Iterator[dict[str, Future[MetadataImportResult]]]:
-        """统一管理元数据并发池，供本地与云端导入复用，调用方按原顺序消费 Future。"""
+    ):
         if not movie_numbers:
             yield {}
             return
@@ -192,391 +156,455 @@ class MediaImportService:
             thread_name_prefix=thread_name_prefix,
         ) as executor:
             yield {
-                movie_number: executor.submit(self._import_movie_metadata, movie_number)
-                for movie_number in movie_numbers
+                number: executor.submit(self._import_movie_metadata, number)
+                for number in movie_numbers
             }
 
     def import_from_source(
         self,
-        source_path: str,
+        source_ref: dict[str, Any],
         library_id: int,
         *,
-        download_task_id: int | None = None,
-        import_job_id: int | None = None,
+        media_kind: str = "jav",
+        source_disposition: str = "keep",
+        collection_id: int | None = None,
         progress_callback: ImportProgressCallback | None = None,
-        transfer_mode: ImportTransferMode = "auto",
-        only_files: list[str] | None = None,
-    ) -> ImportJob:
-        """执行一次完整的媒体导入，并把中间状态写回 ImportJob。
-
-        ``only_files`` 提供时仅导入这些绝对路径，用于失败文件的子集重导。
-        """
-        if transfer_mode not in ("auto", "cleanup-source"):
-            logger.warning("Import rejected invalid transfer mode transfer_mode={}", transfer_mode)
-            raise ValueError("invalid_transfer_mode")
-
-        source_entry = Path(source_path).expanduser().resolve()
-        if not source_entry.exists() or (not source_entry.is_dir() and not source_entry.is_file()):
-            logger.warning("Import rejected invalid source path source_path={}", source_path)
-            raise ValueError("source_path_not_found")
-
-        # 子集重导时把目标文件归一化为绝对路径集合，扫描阶段据此过滤。
-        only_file_set: set[str] | None = None
-        if only_files is not None:
-            only_file_set = {str(Path(item).expanduser().resolve()) for item in only_files}
-
+        operation_namespace: str | None = None,
+    ) -> ImportResult:
+        if not isinstance(source_ref, dict) or not source_ref:
+            raise ApiError(422, "invalid_import_source", "source_ref must be an object")
+        if source_disposition not in {"keep", "delete_after_commit"}:
+            raise ApiError(422, "invalid_source_disposition", "无效的源处置方式")
         library = MediaLibrary.get_or_none(MediaLibrary.id == library_id)
         if library is None:
-            logger.warning("Import rejected because media library not found library_id={}", library_id)
-            raise ValueError("media_library_not_found")
-        if library.backend != MediaLibraryBackend.LOCAL.value:
-            logger.warning(
-                "Import rejected because media library backend is not local library_id={} backend={}",
-                library_id,
-                library.backend,
-            )
-            raise ValueError("media_library_backend_mismatch")
-
-        if transfer_mode == "cleanup-source":
-            matched_library = find_media_library_containing_path(source_entry)
-            if matched_library is not None:
-                logger.warning(
-                    "Import rejected cleanup-source inside media library source_path={} matched_library_id={} matched_library_root={}",
-                    str(source_entry),
-                    matched_library.id,
-                    matched_library.backend_config.get("root_path"),
-                )
-                raise ValueError("cleanup_source_inside_media_library")
-
-        download_task = None
-        if download_task_id is not None:
-            download_task = DownloadTask.get_or_none(DownloadTask.id == download_task_id)
-            if download_task is None:
-                logger.warning(
-                    "Import rejected because download task not found download_task_id={}",
-                    download_task_id,
-                )
-                raise ValueError("download_task_not_found")
-
-        logger.info(
-            "Import start source_path={} library_id={} library_root={} download_task_id={}",
-            str(source_entry),
-            library_id,
-            library.backend_config.get("root_path"),
-            download_task_id,
-        )
-        # 支持创建新任务，也支持复用已有 ImportJob 做重试，后者需要把统计字段全部重置。
-        if import_job_id is None:
-            job = ImportJob.create(
-                source_path=str(source_entry),
-                library=library,
-                download_task=download_task,
-                state=IMPORT_JOB_STATE_PENDING,
-                transfer_mode=transfer_mode,
-            )
-        else:
-            job = ImportJob.get_by_id(import_job_id)
-            job.source_path = str(source_entry)
-            job.library = library
-            job.download_task = download_task
-            job.state = IMPORT_JOB_STATE_PENDING
-            job.transfer_mode = transfer_mode
-            job.imported_count = 0
-            job.skipped_count = 0
-            job.failed_count = 0
-            job.failed_files = "[]"
-            job.started_at = None
-            job.finished_at = None
-            job.save()
-        logger.info("Import job created job_id={} state={}", job.id, job.state)
-        failure_items: list[dict[str, str]] = []
-        imported_count = 0
-        skipped_count = 0
-        failed_count = 0
-        new_playable_movies: dict[int, dict[str, object]] = {}
-
-        job.state = IMPORT_JOB_STATE_RUNNING
-        job.started_at = utc_now_for_db()
-        job.save()
-        if download_task is not None:
-            download_task.import_status = IMPORT_STATUS_RUNNING
-            download_task.save()
-        logger.info("Import job running job_id={}", job.id)
-
+            raise ApiError(404, "media_library_not_found", "媒体库不存在")
+        if media_kind not in {"jav", "video"}:
+            raise ApiError(422, "invalid_media_kind", "无效的媒体类型")
+        if media_kind == "jav" and collection_id is not None:
+            raise ApiError(422, "invalid_collection", "jav import does not support collection_id")
+        storage = self._storage(library)
         try:
-            # 第一阶段只扫描和分组文件，不碰远端元数据和目标媒体库。
-            # scan 命中已入库文件时，cleanup-source 模式下仍需要清理源目录，走 callback 复用共享删源工具。
-            def _cleanup_duplicate_sources(source_paths: list[Path]) -> int:
-                return delete_source_files(source_paths, failure_items, transfer_mode=transfer_mode)
-
-            grouped_files, grouped_skipped_count, grouped_failed_count = scan_source_files(
-                source_entry,
-                failure_items,
-                transfer_mode=transfer_mode,
-                only_file_set=only_file_set,
-                on_duplicate_source_paths=_cleanup_duplicate_sources,
-            )
-            skipped_count += grouped_skipped_count
-            failed_count += grouped_failed_count
-            logger.info(
-                "Import scan completed job_id={} grouped_numbers={} skipped={} failed={}",
-                job.id,
-                len(grouped_files),
-                grouped_skipped_count,
-                grouped_failed_count,
-            )
-            # 子集重导源文件全部缺失，或下载任务目录完全没有媒体候选时，
-            # 都不能静默判 completed，否则下载页会显示“已导入”但媒体库没有任何记录。
-            if (
-                (only_file_set is not None or download_task is not None)
-                and not grouped_files
-                and grouped_skipped_count == 0
-                and grouped_failed_count == 0
-            ):
-                failed_count += 1
-                failure_reason = (
-                    FAILURE_REASON_RETRY_SOURCES_MISSING
-                    if only_file_set is not None
-                    else FAILURE_REASON_NO_MEDIA_FILES_FOUND
-                )
-                failure_detail = (
-                    "待重导的源文件均已不存在"
-                    if only_file_set is not None
-                    else "下载目录中没有扫描到可导入的视频"
-                )
-                failure_items.append(
-                    make_failure_item(source_entry, failure_reason, failure_detail)
-                )
-            total_movie_numbers = len(grouped_files)
-            completed_movie_numbers = 0
-            emit_progress(
-                progress_callback,
-                event="scan_complete",
-                total_movies=total_movie_numbers,
-                current=0,
-                total=total_movie_numbers,
-                text="媒体文件扫描完成",
-                summary_patch={
-                    "imported_count": imported_count,
-                    "skipped_count": skipped_count,
-                    "failed_count": failed_count,
-                    "new_playable_movies": list(new_playable_movies.values()),
-                },
-            )
-
-            if grouped_files:
-                with self.metadata_import_batch(
-                    list(grouped_files),
-                    thread_name_prefix="import-metadata",
-                ) as metadata_futures:
-                    for movie_number, group in grouped_files.items():
-                        logger.info(
-                            "Import processing movie_number={} files={} job_id={}",
-                            movie_number,
-                            len(group.files),
-                            job.id,
-                        )
-                        emit_progress(
-                            progress_callback,
-                            event="movie_started",
-                            stage="metadata",
-                            movie_number=movie_number,
-                            completed_movies=completed_movie_numbers,
-                            total_movies=total_movie_numbers,
-                            imported_count=imported_count,
-                            skipped_count=skipped_count,
-                            failed_count=failed_count,
-                            current=completed_movie_numbers,
-                            total=total_movie_numbers,
-                            text=f"正在抓取影片元数据 {movie_number}",
-                            summary_patch={
-                                "imported_count": imported_count,
-                                "skipped_count": skipped_count,
-                                "failed_count": failed_count,
-                                "new_playable_movies": list(new_playable_movies.values()),
-                            },
-                        )
-
-                        metadata_result = metadata_futures[movie_number].result()
-                        if metadata_result.failure_reason is not None:
-                            for file_entry in group.files:
-                                failed_count += 1
-                                failure_items.append(
-                                    make_failure_item(
-                                        file_entry.path,
-                                        metadata_result.failure_reason,
-                                        metadata_result.failure_detail or "",
-                                    )
-                                )
-                            completed_movie_numbers += 1
-                            emit_progress(
-                                progress_callback,
-                                event="movie_finished",
-                                stage="metadata",
-                                movie_number=movie_number,
-                                completed_movies=completed_movie_numbers,
-                                total_movies=total_movie_numbers,
-                                imported_count=imported_count,
-                                skipped_count=skipped_count,
-                                failed_count=failed_count,
-                                current=completed_movie_numbers,
-                                total=total_movie_numbers,
-                                text=f"影片元数据处理失败 {movie_number}",
-                                summary_patch={
-                                    "imported_count": imported_count,
-                                    "skipped_count": skipped_count,
-                                    "failed_count": failed_count,
-                                    "new_playable_movies": list(new_playable_movies.values()),
-                                },
-                            )
-                            continue
-
-                        movie = Movie.get_by_id(metadata_result.movie_id)
-                        emit_progress(
-                            progress_callback,
-                            event="movie_stage",
-                            stage="import-media",
-                            movie_number=movie_number,
-                            completed_movies=completed_movie_numbers,
-                            total_movies=total_movie_numbers,
-                            imported_count=imported_count,
-                            skipped_count=skipped_count,
-                            failed_count=failed_count,
-                            current=completed_movie_numbers,
-                            total=total_movie_numbers,
-                            text=f"正在导入影片文件 {movie_number}",
-                            summary_patch={
-                                "imported_count": imported_count,
-                                "skipped_count": skipped_count,
-                                "failed_count": failed_count,
-                                "new_playable_movies": list(new_playable_movies.values()),
-                            },
-                        )
-
-                        # 多分部（VR/FC2 等）不做合并：每个文件一条 Media，与 cloud115 管线保持一致。
-                        for file_entry in group.files:
-                            try:
-                                imported, delete_failed_count = import_single_scanned_file(
-                                    file_entry=file_entry,
-                                    library=library,
-                                    movie=movie,
-                                    failure_items=failure_items,
-                                    transfer_mode=transfer_mode,
-                                    now_ms=self.now_ms,
-                                    media_metadata_probe_service=self.media_metadata_probe_service,
-                                )
-                                if imported:
-                                    imported_count += 1
-                                    failed_count += delete_failed_count
-                                    new_playable_movies[movie.id] = {
-                                        "movie_id": movie.id,
-                                        "movie_number": movie.movie_number,
-                                        "title": movie.title,
-                                    }
-                                else:
-                                    skipped_count += 1
-                            except Exception as exc:
-                                failed_count += 1
-                                logger.exception(
-                                    "Import media failed job_id={} movie_number={} source={} detail={}",
-                                    job.id,
-                                    movie_number,
-                                    str(file_entry.path),
-                                    exc,
-                                )
-                                failure_items.append(
-                                    make_failure_item(
-                                        file_entry.path,
-                                        FAILURE_REASON_MEDIA_IMPORT_FAILED,
-                                        str(exc),
-                                    )
-                                )
-
-                        completed_movie_numbers += 1
-                        emit_progress(
-                            progress_callback,
-                            event="movie_finished",
-                            stage="import-media",
-                            movie_number=movie_number,
-                            completed_movies=completed_movie_numbers,
-                            total_movies=total_movie_numbers,
-                            imported_count=imported_count,
-                            skipped_count=skipped_count,
-                            failed_count=failed_count,
-                            current=completed_movie_numbers,
-                            total=total_movie_numbers,
-                            text=f"影片导入完成 {movie_number}",
-                            summary_patch={
-                                "imported_count": imported_count,
-                                "skipped_count": skipped_count,
-                                "failed_count": failed_count,
-                                "new_playable_movies": list(new_playable_movies.values()),
-                            },
-                        )
-
-            # 整个导入过程中即使有单文件失败，也会把已成功结果保留下来，并以 failed 状态返回统计信息。
-            finalize_import_job(
-                job,
-                imported_count=imported_count,
-                skipped_count=skipped_count,
-                failed_count=failed_count,
-                failure_items=failure_items,
-            )
-            if download_task is not None:
-                download_task.import_status = IMPORT_STATUS_FAILED if failed_count > 0 else IMPORT_STATUS_COMPLETED
-                download_task.save()
-            logger.info(
-                "Import job finished job_id={} state={} imported={} skipped={} failed={}",
-                job.id,
-                job.state,
-                job.imported_count,
-                job.skipped_count,
-                job.failed_count,
-            )
-            emit_progress(
-                progress_callback,
-                event="job_finished",
-                current=total_movie_numbers,
-                total=total_movie_numbers,
-                text="媒体导入任务完成",
-                summary_patch={
-                    "imported_count": imported_count,
-                    "skipped_count": skipped_count,
-                    "failed_count": failed_count,
-                    "new_playable_movies": list(new_playable_movies.values()),
-                },
-            )
-            return job
+            if progress_callback is not None and MEDIA_PROVIDER_REGISTRY.supports_scan_progress(library.provider_key):
+                scanned_files = tuple(storage.scan_import_source(
+                    source_ref=source_ref, progress_callback=progress_callback,
+                ))
+            else:
+                scanned_files = tuple(storage.scan_import_source(source_ref=source_ref))
+        except ProviderOperationError as exc:
+            raise self._provider_error(exc) from exc
         except Exception as exc:
-            # 走到这里说明导入流程本身崩溃了，而不是单个文件失败，需要额外补一条任务级错误。
-            failure_items.append(
-                make_failure_item(source_entry, FAILURE_REASON_IMPORT_JOB_CRASHED, str(exc))
+            logger.exception("Provider import scan failed library_id={}", library_id)
+            raise ApiError(502, "provider_scan_failed", "媒体提供方扫描失败") from exc
+        for source in scanned_files:
+            self._validate_import_file(source)
+        from src.config.config import settings
+
+        minimum_video_file_size = settings.media.allowed_min_video_file_size
+
+        failure_items: list[dict[str, str]] = []
+        imported_count = skipped_count = failed_count = 0
+        created_video_ids: list[int] = []
+        new_playable_movies: list[dict[str, object]] = []
+        imported_subtitle_paths: set[str] = set()
+        finalize_error: Exception | None = None
+        import_source_identities: dict[str, str] = {}
+        get_import_source_identity = getattr(storage, "get_import_source_identity", None)
+        if source_disposition == "keep" and callable(get_import_source_identity):
+            for source in scanned_files:
+                if not is_supported_video_file_name(source.name):
+                    continue
+                if media_kind == "jav" and source.size_bytes < minimum_video_file_size:
+                    continue
+                try:
+                    identity = get_import_source_identity(source=source)
+                except ProviderOperationError as exc:
+                    logger.warning(
+                        "Provider import source identity unavailable; falling back to regular import "
+                        "library_id={} source={} code={}",
+                        library_id,
+                        source.name,
+                        exc.code,
+                    )
+                    continue
+                except Exception:
+                    logger.exception(
+                        "Provider import source identity failed; falling back to regular import "
+                        "library_id={} source={}",
+                        library_id,
+                        source.name,
+                    )
+                    continue
+                if identity is None:
+                    continue
+                if not isinstance(identity, str) or not identity:
+                    logger.warning(
+                        "Provider returned invalid import source identity; falling back to regular import "
+                        "library_id={} source={}",
+                        library_id,
+                        source.name,
+                    )
+                    continue
+                import_source_identities[source.relative_path] = identity
+            if import_source_identities:
+                existing_identities = {
+                    identity
+                    for (identity,) in (
+                        Media.select(Media.import_source_identity)
+                        .where(
+                            (Media.library == library)
+                            & Media.import_source_identity.in_(
+                                list(import_source_identities.values())
+                            )
+                        )
+                        .tuples()
+                    )
+                }
+                duplicate_paths = {
+                    relative_path
+                    for relative_path, identity in import_source_identities.items()
+                    if identity in existing_identities
+                }
+                skipped_count += len(duplicate_paths)
+                scanned_files = tuple(
+                    source
+                    for source in scanned_files
+                    if source.relative_path not in duplicate_paths
+                )
+        subtitle_sources = tuple(source for source in scanned_files if self._is_srt(source))
+        operation_namespace = operation_namespace or f"import:{uuid4().hex}"
+        total = len(scanned_files)
+        emit_progress(
+            progress_callback,
+            event="scan_complete",
+            current=0,
+            total=total,
+            text="媒体提供方扫描完成",
+            summary_patch={"imported_count": 0, "skipped_count": 0, "failed_count": 0},
+        )
+
+        metadata_numbers = {
+            number
+            for item in scanned_files
+            if media_kind == "jav"
+            and is_supported_video_file_name(item.name)
+            and item.size_bytes >= minimum_video_file_size
+            and (
+                number := parse_movie_number_from_text(
+                    f"{item.name} {item.relative_path}"
+                )
             )
-            finalize_import_job(
-                job,
-                imported_count=imported_count,
-                skipped_count=skipped_count,
-                failed_count=failed_count + 1,
-                failure_items=failure_items,
+        }
+        with self.metadata_import_batch(sorted(metadata_numbers)) as metadata_futures:
+            for index, source in enumerate(scanned_files, start=1):
+                staged: StagedMedia | None = None
+                video: VideoItem | None = None
+                media: Media | None = None
+                if not is_supported_video_file_name(source.name):
+                    if not self._is_srt(source):
+                        skipped_count += 1
+                    continue
+                if media_kind == "jav" and source.size_bytes < minimum_video_file_size:
+                    skipped_count += 1
+                    continue
+                movie_number = parse_movie_number_from_text(f"{source.name} {source.relative_path}")
+                if media_kind == "jav" and not movie_number:
+                    failed_count += 1
+                    failure_items.append(make_failure_item(source.name, "movie_number_not_found"))
+                    continue
+                if media_kind == "video":
+                    movie_number = None
+                operation_key = self._operation_key(operation_namespace, index)
+                placement = ImportPlacement(
+                    relative_path=(
+                        f"jav/{movie_number}/{source.name}" if movie_number else f"videos/{source.name}"
+                    )
+                )
+                try:
+                    staged = storage.stage_import_file(
+                        source=source,
+                        placement=placement,
+                        source_disposition=source_disposition,
+                        operation_key=operation_key,
+                    )
+                    if not isinstance(staged, StagedMedia):
+                        raise ApiError(502, "provider_invalid_response", "媒体提供方返回了无效暂存结果")
+                    if media_kind == "jav":
+                        metadata = metadata_futures[movie_number].result()
+                        if metadata.movie_id is None:
+                            raise RuntimeError(metadata.failure_detail or metadata.failure_reason or "metadata import failed")
+                        movie = Movie.get_by_id(metadata.movie_id)
+                        media = self._create_media(
+                            storage=storage,
+                            movie=movie,
+                            video_item=None,
+                            library=library,
+                            source=source,
+                            staged=staged,
+                        )
+                        new_playable_movies.append(
+                            {"id": movie.id, "movie_number": movie.movie_number, "title": movie.title}
+                        )
+                    else:
+                        with get_database().atomic():
+                            video = VideoItem.create(title=self._title_for(source))
+                            media = self._create_media(
+                                storage=storage,
+                                movie=None,
+                                video_item=video,
+                                library=library,
+                                source=source,
+                                staged=staged,
+                            )
+                            if collection_id is not None:
+                                from src.service.videos.video_collection_service import (
+                                    VideoCollectionService,
+                                )
+
+                                VideoCollectionService.add_item(collection_id, video.id)
+                        created_video_ids.append(video.id)
+                except ProviderOperationError as exc:
+                    failed_count += 1
+                    failure_items.append(make_failure_item(source.name, exc.code))
+                    self._abort_staged(storage, staged)
+                except Exception as exc:
+                    failed_count += 1
+                    failure_items.append(make_failure_item(source.name, str(exc)))
+                    self._abort_staged(storage, staged)
+                else:
+                    try:
+                        storage.finalize_import(receipt=staged.receipt)
+                    except ProviderOperationError as exc:
+                        failed_count += 1
+                        failure_items.append(make_failure_item(source.name, exc.code))
+                        finalize_error = exc
+                        logger.exception(
+                            "Provider import finalize failed library_id={} source={}",
+                            library_id,
+                            source.name,
+                        )
+                    except Exception as exc:
+                        failed_count += 1
+                        failure_items.append(make_failure_item(source.name, str(exc)))
+                        finalize_error = exc
+                        logger.exception(
+                            "Provider import finalize failed library_id={} source={}",
+                            library_id,
+                            source.name,
+                        )
+                    else:
+                        import_source_identity = import_source_identities.get(source.relative_path)
+                        if import_source_identity is not None and media is not None:
+                            media.import_source_identity = import_source_identity
+                            media.save(only=[Media.import_source_identity])
+                        imported_count += 1
+                        if video is not None and media is not None:
+                            self._generate_video_cover(
+                                storage=storage,
+                                video=video,
+                                media=media,
+                            )
+                        if media_kind == "jav":
+                            failed_count += self._import_sidecar_subtitles(
+                                storage=storage,
+                                video_source=source,
+                                movie_number=movie_number,
+                                subtitle_sources=subtitle_sources,
+                                imported_subtitle_paths=imported_subtitle_paths,
+                                source_disposition=source_disposition,
+                                failure_items=failure_items,
+                            )
+                emit_progress(
+                    progress_callback,
+                    event="file_finished",
+                    current=index,
+                    total=total,
+                    text=f"已处理 {index}/{total}",
+                    summary_patch={
+                        "imported_count": imported_count,
+                        "skipped_count": skipped_count,
+                        "failed_count": failed_count,
+                    },
+                )
+        skipped_count += sum(
+            source.relative_path not in imported_subtitle_paths
+            for source in subtitle_sources
+        )
+        if finalize_error is not None:
+            raise finalize_error
+        return ImportResult(
+            imported_count=imported_count,
+            skipped_count=skipped_count,
+            failed_count=failed_count,
+            new_playable_movies=new_playable_movies,
+            created_video_ids=created_video_ids,
+        )
+
+    @staticmethod
+    def _create_media(
+        *,
+        storage,
+        movie,
+        video_item,
+        library,
+        source: ImportFile,
+        staged: StagedMedia,
+    ) -> Media:
+        with get_database().atomic():
+            media = Media.create(
+                movie=movie,
+                video_item=video_item,
+                library=library,
+                storage_ref=staged.storage_ref,
+                file_name=source.name,
+                file_size_bytes=staged.size_bytes,
+                duration_seconds=max(0, staged.duration_seconds or 0),
+                video_info=staged.video_info,
+                resolution=normalize_media_resolution(staged.resolution),
+                valid=True,
             )
-            if download_task is not None:
-                download_task.import_status = IMPORT_STATUS_FAILED
-                download_task.save()
-            logger.exception(
-                "Import job crashed job_id={} source_path={} detail={}",
-                job.id,
-                str(source_entry),
-                exc,
+            file_hash = storage.compute_file_hash(media=media_handle_for(media))
+            if not isinstance(file_hash, str) or not file_hash:
+                raise ValueError("provider returned an invalid media file hash")
+            media.file_hash = file_hash
+            media.save(only=[Media.file_hash])
+            return media
+
+    @staticmethod
+    def _generate_video_cover(*, storage: Any, video: VideoItem, media: Media) -> None:
+        open_cover_source = getattr(storage, "open_cover_source", None)
+        if not callable(open_cover_source):
+            logger.warning(
+                "Video cover skipped because provider does not support cover source video_id={}",
+                video.id,
             )
-            emit_progress(
-                progress_callback,
-                event="job_failed",
-                text="媒体导入任务失败",
-                summary_patch={
-                    "imported_count": imported_count,
-                    "skipped_count": skipped_count,
-                    "failed_count": failed_count + 1,
-                    "new_playable_movies": list(new_playable_movies.values()),
-                },
+            return
+        try:
+            with open_cover_source(media=media_handle_for(media)) as source:
+                VideoCoverService.generate_cover(video, source)
+        except Exception as exc:
+            logger.warning("Video cover skipped video_id={} detail={}", video.id, exc)
+
+    @staticmethod
+    def _title_for(source: ImportFile) -> str:
+        name = source.name
+        return name.rsplit(".", 1)[0] if "." in name else name
+
+    @staticmethod
+    def _is_srt(source: ImportFile) -> bool:
+        return source.name.lower().endswith(".srt")
+
+    @classmethod
+    def _import_sidecar_subtitles(
+        cls,
+        *,
+        storage,
+        video_source: ImportFile,
+        movie_number: str,
+        subtitle_sources: tuple[ImportFile, ...],
+        imported_subtitle_paths: set[str],
+        source_disposition: str,
+        failure_items: list[dict[str, str]],
+    ) -> int:
+        video_parent = PurePosixPath(video_source.relative_path).parent
+        failed_count = 0
+        for subtitle_source in subtitle_sources:
+            if subtitle_source.relative_path in imported_subtitle_paths:
+                continue
+            if PurePosixPath(subtitle_source.relative_path).parent != video_parent:
+                continue
+            if not subtitle_matches_movie_number(subtitle_source.name, movie_number):
+                continue
+            imported_subtitle_paths.add(subtitle_source.relative_path)
+            try:
+                imported_file = storage.read_import_file(source=subtitle_source)
+                if (
+                    not isinstance(imported_file, ImportFileContent)
+                    or not isinstance(imported_file.content, bytes)
+                    or not isinstance(imported_file.deletion_receipt, dict)
+                    or not imported_file.deletion_receipt
+                ):
+                    raise ValueError("provider returned invalid subtitle content")
+                result = SubtitleAssetService.import_subtitle_content(
+                    movie_number,
+                    imported_file.content,
+                    subtitle_source.name,
+                )
+                if result.status not in {
+                    SubtitleImportStatus.IMPORTED,
+                    SubtitleImportStatus.DUPLICATE,
+                }:
+                    raise ValueError(f"subtitle import rejected: {result.status}")
+                if source_disposition == "delete_after_commit":
+                    storage.delete_import_file(receipt=imported_file.deletion_receipt)
+            except ProviderOperationError as exc:
+                logger.warning(
+                    "Import sidecar subtitle failed movie_number={} source={} code={}",
+                    movie_number,
+                    subtitle_source.name,
+                    exc.code,
+                )
+                failure_items.append(make_failure_item(subtitle_source.name, exc.code))
+                failed_count += 1
+            except Exception as exc:
+                logger.warning(
+                    "Import sidecar subtitle failed movie_number={} source={} detail={}",
+                    movie_number,
+                    subtitle_source.name,
+                    exc,
+                )
+                failure_items.append(make_failure_item(subtitle_source.name, str(exc)))
+                failed_count += 1
+        return failed_count
+
+    @staticmethod
+    def _validate_import_file(source: object) -> None:
+        if not isinstance(source, ImportFile):
+            raise ApiError(502, "provider_invalid_response", "媒体提供方返回了无效文件")
+        name = source.name
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or "\x00" in name
+        ):
+            raise ApiError(502, "provider_invalid_response", "媒体提供方返回了不安全文件名")
+        if (
+            not isinstance(source.size_bytes, int)
+            or isinstance(source.size_bytes, bool)
+            or source.size_bytes < 0
+            or not isinstance(source.is_video, bool)
+        ):
+            raise ApiError(
+                502, "provider_invalid_response", "媒体提供方返回了无效文件信息"
             )
-            raise
+
+    @staticmethod
+    def _operation_key(operation_namespace: str, index: int) -> str:
+        return f"{operation_namespace}:{index}"
+
+    @staticmethod
+    def _abort_staged(storage, staged: object) -> None:
+        if not isinstance(staged, StagedMedia):
+            return
+        try:
+            storage.abort_import(receipt=staged.receipt)
+        except Exception:
+            logger.exception("Provider import abort failed")
+
+    @staticmethod
+    def _provider_error(exc: ProviderOperationError) -> ApiError:
+        status = {
+            "invalid_config": 422,
+            "authentication_failed": 401,
+            "source_not_found": 404,
+            "unsupported": 422,
+            "unavailable": 503,
+        }.get(exc.code, 502)
+        return ApiError(
+            status,
+            f"provider_{exc.code}",
+            exc.safe_message,
+            {"provider_key": exc.provider_key, "operation": exc.operation},
+        )

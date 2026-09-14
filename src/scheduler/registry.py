@@ -1,87 +1,75 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
-
 from src.config.config import settings
-from src.metadata.factory import refresh_gfriends_filetree
 from src.plugins.contracts import PluginRegistration
 from src.plugins.loader import PLUGIN_LOAD_ERRORS, load_enabled_plugins
-from src.scheduler.ranking_plugin_adapter import apply_plugin_ranking_sources
+from src.plugins.provider_protocol import refresh_media_provider_registry
 from src.scheduler.contracts import JobDefinition
-from src.scheduler.queue_tasks import QUEUE_TASK_REGISTRY
+from src.scheduler.queue_tasks import (
+    QUEUE_TASK_REGISTRY,
+    _run_gfriends_filetree_refresh,
+)
+from src.scheduler.ranking_plugin_adapter import apply_plugin_ranking_sources
 from src.service.catalog import (
-    MovieCollectionService,
     MovieHeatService,
     MovieInteractionSyncService,
+    MovieTaskService,
     SubscribedActorMovieSyncService,
+)
+from src.service.catalog.metadata_source_service import MetadataSourceService
+from src.service.catalog.movie_javdb_backfill_service import MovieJavdbBackfillService
+from src.service.catalog.movie_subscription_search_state_service import (
+    MovieSubscriptionSearchStateService,
 )
 from src.service.discovery import (
     DailyRecommendationService,
-    HotReviewSyncService,
     ImageSearchIndexService,
     MomentRecommendationService,
     MovieRecommendationService,
 )
 from src.service.playback import (
-    Cloud115KeepaliveService,
-    MediaFileScanService,
+    MediaFileHashBackfillService,
     MediaThumbnailService,
+    MediaValidityScanService,
 )
-from src.service.system import ActivityCleanupService, ResourceTaskAttemptCleanupService
-from src.service.system.resource_task_runner import ResourceTaskLedger
-from src.service.transfers.cloud115.offline.sync_service import (
-    Cloud115OfflineSyncService,
+from src.service.playback.media_video_info_backfill_service import (
+    MediaVideoInfoBackfillService,
 )
+from src.service.system import ActivityCleanupService
 from src.service.transfers.downloads.auto_subscribed.auto_download_service import (
     SubscribedMovieAutoDownloadService,
 )
-from src.service.transfers.downloads.small_file_cleanup_service import (
-    DownloadSmallFileCleanupService,
-)
-from src.service.transfers.downloads.stalled_cleanup_service import (
-    QBStalledCleanupService,
-)
 from src.service.transfers.downloads.sync_service import DownloadSyncService
-
-
-def _build_stats_formatter(
-    prefix: str,
-    *names: str,
-    **defaults: Any,
-) -> Callable[[dict[str, Any]], str]:
-    def _formatter(stats: dict[str, Any]) -> str:
-        # 统一在这里处理缺省值（默认 0，个别字段经 **defaults 覆盖），
-        # 避免注册表里散落大量重复的 s.get(...) 与 (name, name, 0) 三元组。
-        formatted_fields = [
-            f"{name}={stats.get(name, defaults.get(name, 0))}"
-            for name in (*names, *defaults)
-        ]
-        return f"{prefix} {' '.join(formatted_fields)}"
-
-    return _formatter
-
 
 # ---------------------------------------------------------------------------
 # 任务注册表
 # ---------------------------------------------------------------------------
 
+
+def _run_movie_heat(reporter, params):
+    return (
+        MovieTaskService.execute_movie_heat(reporter, params)
+        if params
+        else MovieHeatService.update_movie_heat()
+    )
+
 BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
+    JobDefinition(
+        task_key="movie_javdb_backfill",
+        log_name="movie-javdb-backfill",
+        cli_name="backfill-movie-javdb",
+        cli_help="尝试从 JavDB 补录插件影片",
+        cron_setting="movie_javdb_backfill_cron",
+        handler=lambda reporter, _params: MovieJavdbBackfillService().run(reporter=reporter),
+    ),
     JobDefinition(
         task_key="actor_subscription_sync",
         log_name="actor-subscription-sync",
         cli_name="sync-subscribed-actor-movies",
         cli_help="执行一次订阅女优影片抓取",
         cron_setting="actor_subscription_sync_cron",
-        service_factory=lambda reporter: SubscribedActorMovieSyncService().sync_subscribed_actor_movies(
+        handler=lambda reporter, _params: SubscribedActorMovieSyncService().sync_subscribed_actor_movies(
             progress_callback=reporter.progress_callback,
-        ),
-        format_stats=_build_stats_formatter(
-            "sync finished:",
-            "total_actors",
-            "success_actors",
-            "failed_actors",
-            "imported_movies",
         ),
     ),
     JobDefinition(
@@ -90,23 +78,12 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="auto-download-subscribed-movies",
         cli_help="执行一次已订阅缺失影片自动下载",
         cron_setting="subscribed_movie_auto_download_cron",
-        # 已迁 kernel（Wave 2）：runner 直接使用 reporter.emit 上报进度。
-        service_factory=lambda reporter: SubscribedMovieAutoDownloadService().run(reporter=reporter),
+        handler=lambda reporter, _params: SubscribedMovieAutoDownloadService().run(reporter=reporter),
         business_recovery=lambda: {
-            "recovered_running_movies": ResourceTaskLedger.recover_running(
-                "subscribed_movie_auto_download",
-                error_message="订阅影片资源查询任务中断，等待重试",
+            "recovered_running_movies": (
+                MovieSubscriptionSearchStateService.recover_interrupted_running_movies()
             )
         },
-        format_stats=_build_stats_formatter(
-            "auto download finished:",
-            "candidate_movies",
-            "searched_movies",
-            "submitted_movies",
-            "no_candidate_movies",
-            "skipped_movies",
-            "failed_movies",
-        ),
     ),
     JobDefinition(
         task_key="movie_heat_update",
@@ -114,13 +91,7 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="update-movie-heat",
         cli_help="执行一次影片热度重算",
         cron_setting="movie_heat_cron",
-        service_factory=lambda _reporter: MovieHeatService.update_movie_heat(),
-        format_stats=_build_stats_formatter(
-            "heat update finished:",
-            "candidate_count",
-            "updated_count",
-            formula_version="unknown",
-        ),
+        handler=_run_movie_heat,
     ),
     JobDefinition(
         task_key="movie_interaction_sync",
@@ -128,57 +99,7 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="sync-movie-interactions",
         cli_help="执行一次影片互动数同步",
         cron_setting="movie_interaction_sync_cron",
-        # 已迁 kernel（Wave 2）：runner 直接使用 reporter.emit 上报进度。
-        service_factory=lambda reporter: MovieInteractionSyncService().run(reporter=reporter),
-        business_recovery=lambda: {
-            "recovered_running_movies": MovieInteractionSyncService.recover_interrupted_running_movies(
-                error_message=MovieInteractionSyncService.INTERRUPTED_SYNC_ERROR_MESSAGE,
-            )
-        },
-        format_stats=_build_stats_formatter(
-            "movie interaction sync finished:",
-            "candidate_movies",
-            "processed_movies",
-            "succeeded_movies",
-            "failed_movies",
-            "updated_movies",
-            "unchanged_movies",
-            "heat_updated_movies",
-        ),
-    ),
-    JobDefinition(
-        task_key="hot_review_sync",
-        log_name="hot-review-sync",
-        cli_name="sync-hot-reviews",
-        cli_help="执行一次 JavDB 热评同步",
-        cron_setting="hot_review_sync_cron",
-        service_factory=lambda _reporter: HotReviewSyncService().sync_all_hot_reviews(),
-        format_stats=_build_stats_formatter(
-            "hot review sync finished:",
-            "total_periods",
-            "success_periods",
-            "failed_periods",
-            "fetched_reviews",
-            "imported_movies",
-            "skipped_reviews",
-            "stored_items",
-        ),
-    ),
-    JobDefinition(
-        task_key="movie_collection_sync",
-        log_name="movie-collection-sync",
-        cli_name="sync-movie-collections",
-        cli_help="执行一次合集影片标记同步",
-        cron_setting="movie_collection_sync_cron",
-        service_factory=lambda _reporter: MovieCollectionService.sync_movie_collections(),
-        format_stats=_build_stats_formatter(
-            "collection sync finished:",
-            "total_movies",
-            "matched_count",
-            "updated_to_collection_count",
-            "updated_to_single_count",
-            "unchanged_count",
-        ),
+        handler=lambda reporter, _params: MovieInteractionSyncService().run(reporter=reporter),
     ),
     JobDefinition(
         task_key="download_task_sync",
@@ -186,7 +107,7 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="sync-download-tasks",
         cli_help="执行一次下载任务状态同步",
         cron_setting="download_task_sync_cron",
-        service_factory=lambda _reporter: DownloadSyncService().sync_all_clients(),
+        handler=lambda _reporter, _params: DownloadSyncService().sync_all_clients(),
     ),
     JobDefinition(
         task_key="download_task_auto_import",
@@ -194,75 +115,36 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="auto-import-download-tasks",
         cli_help="执行一次已完成下载自动导入",
         cron_setting="download_task_auto_import_cron",
-        service_factory=lambda _reporter: DownloadSyncService().enqueue_auto_imports(),
+        handler=lambda _reporter, _params: DownloadSyncService().enqueue_auto_imports(),
     ),
     JobDefinition(
-        task_key="cloud115_offline_sync",
-        log_name="cloud115-offline-sync",
-        cli_name="sync-cloud115-offline-tasks",
-        cli_help="执行一次 cloud115 离线任务对账（进度回写 / 完成导入 / 超时放弃）",
-        cron_setting="cloud115_offline_sync_cron",
-        service_factory=lambda _reporter: Cloud115OfflineSyncService().run(),
-        format_stats=_build_stats_formatter(
-            "cloud115 offline sync finished:",
-            "total_clients",
-            "updated_count",
-            "import_triggered_count",
-            "abandoned_count",
-            "failed_count",
+        task_key=MediaFileHashBackfillService.TASK_KEY,
+        log_name="media-file-hash-backfill",
+        cli_name="backfill-media-file-hashes",
+        cli_help="执行一次空媒体文件哈希补算",
+        cron_setting="media_file_hash_backfill_cron",
+        handler=lambda reporter, _params: MediaFileHashBackfillService.backfill_missing_file_hashes(
+            reporter=reporter,
         ),
     ),
     JobDefinition(
-        task_key="download_small_file_cleanup",
-        log_name="download-small-file-cleanup",
-        cli_name="cleanup-download-small-files",
-        cli_help="执行一次下载中种子的小文件清理",
-        cron_setting="download_small_file_cleanup_cron",
-        service_factory=lambda _reporter: DownloadSmallFileCleanupService().cleanup_small_files(),
-        format_stats=_build_stats_formatter(
-            "download small file cleanup finished:",
-            "total_clients",
-            "scanned_torrents",
-            "deselected_files",
-            "deleted_files",
-            "failed_count",
+        task_key=MediaVideoInfoBackfillService.TASK_KEY,
+        log_name="media-video-info-backfill",
+        cli_name="backfill-media-video-info",
+        cli_help="媒体信息回填",
+        manual_only=True,
+        handler=lambda reporter, _params: MediaVideoInfoBackfillService.backfill_missing_video_infos(
+            reporter=reporter,
         ),
     ),
     JobDefinition(
-        task_key="qb_stalled_cleanup",
-        log_name="qb-stalled-cleanup",
-        cli_name="cleanup-qb-stalled-tasks",
-        cli_help="清理 qB 中长期停滞/龟速的下载任务（删种+删文件+拉黑）",
-        cron_setting="qbittorrent_stalled_cleanup_cron",
-        service_factory=lambda _reporter: QBStalledCleanupService().cleanup_stalled_tasks(),
-        format_stats=_build_stats_formatter(
-            "qb stalled cleanup finished:",
-            "total_clients",
-            "scanned_torrents",
-            "cleaned_count",
-            "failed_count",
-        ),
-    ),
-    JobDefinition(
-        task_key="media_file_scan",
+        task_key=MediaValidityScanService.TASK_KEY,
         log_name="media-file-scan",
         cli_name="scan-media-files",
         cli_help="执行一次媒体文件巡检",
         cron_setting="media_file_scan_cron",
-        service_factory=lambda reporter: MediaFileScanService().scan_media_files(
-            progress_callback=reporter.progress_callback,
-        ),
-        format_stats=_build_stats_formatter(
-            "media file scan finished:",
-            "scanned_media",
-            "updated_media",
-            "skipped_media",
-            "failed_media",
-            "invalidated_media",
-            "revived_media",
-            # 远端清单枚举失败的 cloud115 库数：非 0 时该库媒体本轮未做 valid 判定，
-            # 结果与"全部正常"同形，必须单独出数。
-            "cloud115_index_failed_libraries",
+        handler=lambda reporter, _params: MediaValidityScanService.scan_media_validity(
+            reporter=reporter,
         ),
     ),
     JobDefinition(
@@ -271,35 +153,19 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="generate-media-thumbnails",
         cli_help="执行一次媒体缩略图生成",
         cron_setting="media_thumbnail_cron",
-        # 已迁 kernel（Wave 2）：runner 直接使用 reporter.emit 上报进度。
-        service_factory=lambda reporter: MediaThumbnailService.generate_pending_thumbnails(
+        handler=lambda reporter, _params: MediaThumbnailService.generate_pending_thumbnails(
             reporter=reporter,
-        ),
-        format_stats=_build_stats_formatter(
-            "thumbnail generation finished:",
-            "pending_media",
-            "successful_media",
-            "generated_thumbnails",
-            "deferred_media",
-            "retryable_failed_media",
-            "terminal_failed_media",
-            "exhausted_media",
         ),
     ),
     JobDefinition(
         task_key="image_search_index",
         log_name="image-search-index",
-        cli_name="index-image-search-thumbnails",
-        cli_help="执行一次以图搜图缩略图向量索引",
+        cli_name="index-image-search",
+        cli_help="持续构建缩略图和剧情图的搜索向量索引，直到待处理队列为空",
         cron_setting="image_search_index_cron",
-        service_factory=lambda reporter: ImageSearchIndexService().index_pending_thumbnails(
+        handler=lambda reporter, params: ImageSearchIndexService().index_pending_images(
             progress_callback=reporter.progress_callback,
-        ),
-        format_stats=_build_stats_formatter(
-            "image search index finished:",
-            "pending_thumbnails",
-            "successful_thumbnails",
-            "failed_thumbnails",
+            reset=params.get("reset") is True,
         ),
     ),
     JobDefinition(
@@ -308,15 +174,8 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="recompute-movie-similarities",
         cli_help="执行一次影片相似度全量重算",
         cron_setting="movie_similarity_recompute_cron",
-        service_factory=lambda reporter: MovieRecommendationService().recompute_all(
+        handler=lambda reporter, _params: MovieRecommendationService().recompute_all(
             progress_callback=reporter.progress_callback,
-        ),
-        format_stats=_build_stats_formatter(
-            "movie similarity recompute finished:",
-            "total_movies",
-            "indexed_movies",
-            "actor_features",
-            "tag_features",
         ),
     ),
     JobDefinition(
@@ -325,16 +184,8 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="generate-moment-recommendations",
         cli_help="执行一次推荐时刻生成",
         cron_setting="moment_recommendation_generate_cron",
-        service_factory=lambda reporter: MomentRecommendationService().generate_recommendations(
+        handler=lambda reporter, _params: MomentRecommendationService().generate_recommendations(
             progress_callback=reporter.progress_callback,
-        ),
-        format_stats=_build_stats_formatter(
-            "moment recommendation generate finished:",
-            "seed_points",
-            "visual_candidates",
-            "similar_candidates",
-            "popular_candidates",
-            "stored_items",
         ),
     ),
     JobDefinition(
@@ -343,27 +194,8 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="generate-daily-recommendations",
         cli_help="执行一次每日推荐快照生成",
         cron_setting="daily_recommendation_generate_cron",
-        service_factory=lambda reporter: DailyRecommendationService.generate_latest_snapshot(
+        handler=lambda reporter, _params: DailyRecommendationService.generate_latest_snapshot(
             progress_callback=reporter.progress_callback,
-        ),
-        format_stats=_build_stats_formatter(
-            "daily recommendation generate finished:",
-            "candidate_movies",
-            "stored_items",
-            cold_start=False,
-            extreme_cold_start=False,
-        ),
-    ),
-    JobDefinition(
-        task_key="image_search_optimize",
-        log_name="image-search-optimize",
-        cli_name="optimize-image-search-index",
-        cli_help="执行一次以图搜图向量索引优化",
-        cron_setting="image_search_optimize_cron",
-        service_factory=lambda _reporter: ImageSearchIndexService().optimize_index(),
-        format_stats=_build_stats_formatter(
-            "image search optimize finished:",
-            optimized=False,
         ),
     ),
     JobDefinition(
@@ -372,54 +204,15 @@ BUILTIN_JOB_REGISTRY: list[JobDefinition] = [
         cli_name="refresh-gfriends-filetree",
         cli_help="拉取一次 GFriends Filetree 并写入本地缓存",
         cron_setting="gfriends_filetree_refresh_cron",
-        service_factory=lambda _reporter: refresh_gfriends_filetree(force=True),
-        format_stats=_build_stats_formatter(
-            "gfriends filetree refresh finished:",
-            "entries",
-            "bytes_written",
-            source="unknown",
-        ),
+        handler=_run_gfriends_filetree_refresh,
     ),
     JobDefinition(
         task_key="activity_record_cleanup",
         log_name="activity-record-cleanup",
         cli_name="cleanup-activity-records",
-        cli_help="执行一次活动中心记录清理（事件流 / 任务运行 / 已读通知）",
+        cli_help="执行一次活动中心记录清理（任务运行 / 已读通知）",
         cron_setting="activity_cleanup_cron",
-        service_factory=lambda _reporter: ActivityCleanupService().cleanup(),
-        format_stats=_build_stats_formatter(
-            "activity record cleanup finished:",
-            "deleted_events",
-            "deleted_task_runs",
-            "deleted_notifications",
-        ),
-    ),
-    JobDefinition(
-        task_key="resource_task_attempt_cleanup",
-        log_name="resource-task-attempt-cleanup",
-        cli_name="cleanup-resource-task-attempts",
-        cli_help="执行一次资源任务尝试历史保留期清理",
-        cron_setting="resource_task_attempt_cleanup_cron",
-        service_factory=lambda _reporter: ResourceTaskAttemptCleanupService().cleanup(),
-        format_stats=_build_stats_formatter(
-            "resource task attempt cleanup finished:",
-            "deleted_attempts",
-        ),
-    ),
-    JobDefinition(
-        task_key="cloud115_cookies_keepalive",
-        log_name="cloud115-cookies-keepalive",
-        cli_name="keepalive-cloud115-cookies",
-        cli_help="执行一次 cloud115 库 cookies 探活与快照回写",
-        cron_setting="cloud115_keepalive_cron",
-        service_factory=lambda _reporter: Cloud115KeepaliveService().run(),
-        format_stats=_build_stats_formatter(
-            "cloud115 keepalive finished:",
-            "total",
-            "alive",
-            "expired",
-            "unavailable",
-        ),
+        handler=lambda _reporter, _params: ActivityCleanupService().cleanup(),
     ),
 ]
 
@@ -469,7 +262,7 @@ def _build_job_registry(
                 continue
             owners[value] = owner
 
-    # 队列专属 key 冲突同样只隔离插件（内建与队列同 key 是设计内语义）。
+    # 队列专属 key 冲突同样只隔离插件。
     result: list[JobDefinition] = [*builtin_jobs]
     for plugin in plugins:
         if plugin.plugin_id in rejected_plugins:
@@ -506,4 +299,14 @@ JOB_REGISTRY: list[JobDefinition] = _build_job_registry(
     BUILTIN_JOB_REGISTRY,
     _ACTIVE_PLUGINS,
 )
+# 任务注册阶段也可能隔离插件；最终 provider registry 只能保留完整通过
+# 所有宿主注册表的插件，避免被拒插件仍出现在媒体库 provider catalog。
+_ACTIVE_PLUGINS = tuple(
+    plugin
+    for plugin in _ACTIVE_PLUGINS
+    if PLUGIN_LOAD_ERRORS.get(plugin.plugin_id, {}).get("stage")
+    != "registry_conflict"
+)
+refresh_media_provider_registry(_ACTIVE_PLUGINS)
+MetadataSourceService.register(_ACTIVE_PLUGINS)
 JOB_REGISTRY_BY_KEY: dict[str, JobDefinition] = {job.task_key: job for job in JOB_REGISTRY}

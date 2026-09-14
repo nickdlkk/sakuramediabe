@@ -1,5 +1,5 @@
 import peewee
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 
 from src.api.exception.errors import ApiError
 from src.api.routers.deps import db_deps, get_current_user, require_admin_dependency
@@ -8,7 +8,7 @@ from src.scheduler.contracts import JobDefinition
 from src.scheduler.registry import JOB_REGISTRY, JOB_REGISTRY_BY_KEY
 from src.schema.system.activity import TaskRunResource
 from src.schema.system.jobs import JobMetadataResource, ManualJobTriggerResponse
-from src.service.system.activity_service import TaskRunConflictError
+from src.service.system.activity import TaskRunConflictError
 from src.start.aps import get_job_cron_setting, resolve_job_cron_expr, submit_manual_job
 
 router = APIRouter(
@@ -56,7 +56,11 @@ def list_jobs():
     return [_build_job_metadata(job_def, latest.get(job_def.task_key)) for job_def in JOB_REGISTRY]
 
 
-@router.post("/system/jobs/{task_key}/run", response_model=ManualJobTriggerResponse)
+@router.post(
+    "/system/jobs/{task_key}/run",
+    response_model=ManualJobTriggerResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def trigger_job(task_key: str, payload: dict | None = None):
     job_def = JOB_REGISTRY_BY_KEY.get(task_key)
     if job_def is None:
@@ -69,9 +73,25 @@ def trigger_job(task_key: str, payload: dict | None = None):
         )
 
     params = None
-    if job_def.params_schema is not None:
+    if payload is None:
+        if job_def.manual_only and job_def.params_schema is not None:
+            # 声明参数模型的 manual_only 任务必须显式提供参数；无参任务可直接入队。
+            raise ApiError(
+                422,
+                "invalid_job_params",
+                f"任务 {task_key} 必须提供请求参数",
+            )
+    elif job_def.params_schema is None:
+        # 无参数任务不接受显式 body，避免调用方误以为参数会生效。
+        raise ApiError(
+            422,
+            "invalid_job_params",
+            f"任务 {task_key} 不支持请求参数",
+        )
+    else:
         try:
-            params = job_def.params_schema.model_validate(payload or {}).model_dump()
+            # 显式 JSON 对象严格按 schema 校验；空对象同样代表一次带参调用。
+            params = job_def.params_schema.model_validate(payload).model_dump()
         except Exception as exc:
             raise ApiError(
                 422,

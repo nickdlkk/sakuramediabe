@@ -1,8 +1,8 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import Field
 
-from src.lib.cloud115 import Cloud115CookieStatus
 from src.schema.common.base import SchemaModel
 
 
@@ -27,8 +27,10 @@ class StatusMediaLibrarySummary(SchemaModel):
 
 
 class StatusThumbnailSummary(SchemaModel):
-    # 待生成缩略图的媒体文件数量，以及已生成的缩略图文件总数。
+    # pending 为当前可领取量；retry_wait 未到退避时间；terminal 须人工点名重试。
     pending_media: int
+    retry_wait_media: int
+    terminal_failed_media: int
     total: int
 
 
@@ -41,40 +43,12 @@ class StatusResource(SchemaModel):
     thumbnails: StatusThumbnailSummary
 
 
-class StatusCloud115LibraryCookieResource(SchemaModel):
-    library_id: int
-    name: str
-    cookie_status: Cloud115CookieStatus
-
-
-class StatusCloud115CookieSummary(SchemaModel):
-    total: int
-    alive: int
-    expired: int
-    unavailable: int
-
-
-class StatusCloud115CookiesResource(SchemaModel):
-    checked_at: datetime
-    summary: StatusCloud115CookieSummary
-    libraries: list[StatusCloud115LibraryCookieResource]
-
-
-class StatusJoyTagSummary(SchemaModel):
+class StatusEmbeddingServiceSummary(SchemaModel):
     healthy: bool
     endpoint: str | None = None
-    backend: str | None = None
-    execution_provider: str | None = None
-    used_device: str | None = None
-    available_devices: list[str] = Field(default_factory=list)
-    device_full_name: str | None = None
-    prefer_gpu: bool | None = None
-    model_dir: str | None = None
-    model_file: str | None = None
-    model_name: str | None = None
-    vector_size: int | None = None
-    image_size: int | None = None
-    probe_latency_ms: int | None = None
+    space_id: str | None = None
+    dimension: int | None = None
+    modalities: list[str] = Field(default_factory=list)
     error: str | None = None
 
 
@@ -93,15 +67,26 @@ class StatusImageSearchVectorStoreSummary(SchemaModel):
 class StatusImageSearchIndexingSummary(SchemaModel):
     pending_thumbnails: int
     failed_thumbnails: int
-    success_thumbnails: int
+
+
+class StatusImageSearchIndexSpaceSummary(SchemaModel):
+    state: Literal["ready", "rebuild_required", "uninitialized", "unavailable"]
+    indexed_space_id: str | None = None
+    current_space_id: str | None = None
+    is_rebuilding: bool = False
 
 
 class StatusImageSearchResource(SchemaModel):
     healthy: bool
     checked_at: datetime
-    joytag: StatusJoyTagSummary
+    embedding_service: StatusEmbeddingServiceSummary
     image_search_vector_store: StatusImageSearchVectorStoreSummary
     indexing: StatusImageSearchIndexingSummary
+    index_space: StatusImageSearchIndexSpaceSummary
+
+
+class ImageSearchResetResource(SchemaModel):
+    task_run_id: int
 
 
 class StatusMetadataProviderTestError(SchemaModel):

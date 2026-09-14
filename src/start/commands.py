@@ -9,27 +9,15 @@ import click
 from loguru import logger
 
 import src.common.logging as app_logging
-from src.api.exception.errors import ApiError
 from src.common.logging import configure_logging
 from src.config.config import settings
 from src.metadata.factory import build_javdb_provider
 from src.metadata.provider import MetadataNotFoundError, MetadataRequestError
 from src.model import init_database
-from src.model.enums import MediaLibraryBackend
 from src.plugins.manager import PluginManager
-from src.scheduler.progress import TqdmProgressAdapter
-from src.schema.playback.media_libraries import MediaLibraryCreateRequest
 from src.service.catalog import MovieThinCoverBackfillService
-from src.service.catalog.movie_asset_shard_migration_service import (
-    MovieAssetShardMigrationService,
-)
-from src.service.catalog.movie_subtitle_unify_migration_service import (
-    MovieSubtitleUnifyMigrationService,
-)
-from src.service.catalog.plot_layout_migration_service import PlotLayoutMigrationService
-from src.service.playback import MediaLibraryService
-from src.service.playback.jav_layout_migration_service import JavLayoutMigrationService
 from src.service.system import TaskRunConflictError
+from src.service.system.plugin_removal_service import PluginRemovalService
 from src.start.initdb import create_tables
 
 
@@ -228,13 +216,15 @@ def migrate():
     help="Seconds between connection attempts.",
 )
 def wait_db(timeout_seconds: float, interval_seconds: float):
-    """等待 PostgreSQL 可连接；供容器启动时在迁移前对齐数据库就绪时序"""
+    """落盘运行配置并等待 PostgreSQL 可连接"""
     import time
 
     from peewee import OperationalError
 
+    from src.config.config import ensure_runtime_config
     from src.model.base import create_database
 
+    ensure_runtime_config()
     deadline = time.monotonic() + timeout_seconds
     attempt = 0
     last_error: OperationalError | None = None
@@ -303,7 +293,7 @@ def test_javdb(movie_number: str, output_json: bool):
 class _LazyApsGroup(click.Group):
     """APS 子命令组：首次调用时才从 JOB_REGISTRY 注册子命令。
 
-    插件在 import 期加载有副作用（依赖安装、插件代码执行），插件管理 CLI
+    插件在 import 期会执行插件代码，插件管理 CLI
     （plugins list/install 等）不应为此被迫加载全部插件，因此注册表访问
     推迟到真正执行 APS 子命令时。
     """
@@ -332,35 +322,29 @@ def aps(ctx: click.Context):
 
 
 # ---------------------------------------------------------------------------
-# 基于 JOB_REGISTRY 自动注册 APS 子命令，每个命令带 tqdm 进度条
+# 基于 JOB_REGISTRY 自动注册 APS 子命令；命令只负责提交队列
 # ---------------------------------------------------------------------------
 
 
 def _run_cli_job(job_def, params=None):
     from src.start.aps import run_job
 
-    adapter = TqdmProgressAdapter()
     try:
-        stats = run_job(
+        task_run = run_job(
             job_def,
             trigger_type="manual",
             params=params,
-            extra_callbacks=[adapter.callback],
         )
     except TaskRunConflictError as exc:
         raise click.ClickException(str(exc))
-    finally:
-        adapter.close()
-    if job_def.format_stats and isinstance(stats, dict):
-        click.echo(job_def.format_stats(stats))
-    else:
-        click.echo(f"{job_def.cli_name} finished: {stats}")
+    if task_run is None:
+        raise click.ClickException(f"{job_def.cli_name} 未能入队")
+    click.echo(
+        f"{job_def.cli_name} queued: task_run_id={task_run.id} state={task_run.state}"
+    )
 
 
 def _register_aps_command(job_def, group):
-    if job_def.manual_only and job_def.params_schema is None:
-        # 无参的 manual_only 任务只能走 HTTP 触发，CLI 无法表达触发参数。
-        return
     if job_def.params_schema is None:
         @group.command(name=job_def.cli_name, help=job_def.cli_help)
         def _cmd():
@@ -372,12 +356,20 @@ def _register_aps_command(job_def, group):
     @click.option(
         "--params-json",
         required=job_def.manual_only,
-        default=None if job_def.manual_only else "{}",
         help="任务参数 JSON，按任务声明的 params_schema 校验",
     )
     def _cmd_with_params(params_json):
-        payload = json.loads(params_json or "{}")
-        job_def.params_schema.model_validate(payload)
+        payload = None
+        if params_json is not None:
+            decoded = json.loads(params_json)
+            if decoded is None:
+                if job_def.manual_only:
+                    raise click.BadParameter(
+                        "当前任务的参数不能为 JSON null",
+                        param_hint="--params-json",
+                    )
+            else:
+                payload = job_def.params_schema.model_validate(decoded).model_dump()
         _run_cli_job(job_def, params=payload)
 
 
@@ -426,17 +418,23 @@ def plugins_install(plugin_path: Path, sha256: str | None, no_enable: bool):
         return manager.install(plugin_path, enable=not no_enable)
 
     result = _plugin_operation(_install)
+    restart_message = (
+        "重启服务容器后同步依赖并生效"
+        if PluginManager().pending_restart_for(result["plugin_id"]) == ["container"]
+        else "重启 api 与 aps 后生效"
+    )
     click.echo(
         f"插件 {result['plugin_id']} v{result['version']} 已安装；"
-        "重启 api 与 aps 后生效"
+        f"{restart_message}"
     )
 
 
 @plugins_group.command("remove")
 @click.argument("plugin_id")
 def plugins_remove(plugin_id: str):
-    """删除插件目录（含 data/，请先自行备份）。"""
-    _plugin_operation(lambda: PluginManager().remove(plugin_id))
+    """删除插件代码并保留 data/；被媒体库使用的 provider 不可删除。"""
+    _ensure_database_ready()
+    _plugin_operation(lambda: PluginRemovalService.remove(plugin_id))
     click.echo(f"插件 {plugin_id} 已删除")
 
 
@@ -444,8 +442,14 @@ def plugins_remove(plugin_id: str):
 @click.argument("plugin_id")
 def plugins_enable(plugin_id: str):
     """启用插件（写入 enabled，重启后生效）。"""
-    _plugin_operation(lambda: PluginManager().set_enabled(plugin_id, True))
-    click.echo(f"插件 {plugin_id} 已启用；重启 api 与 aps 后生效")
+    manager = PluginManager()
+    _plugin_operation(lambda: manager.set_enabled(plugin_id, True))
+    restart_message = (
+        "重启服务容器后同步依赖并生效"
+        if manager.pending_restart_for(plugin_id) == ["container"]
+        else "重启 api 与 aps 后生效"
+    )
+    click.echo(f"插件 {plugin_id} 已启用；{restart_message}")
 
 
 @plugins_group.command("disable")
@@ -469,7 +473,28 @@ def plugins_check(plugin_dir: Path):
     click.echo(f"插件 {plugin_dir.name} 校验通过")
 
 
+@plugins_group.command("sync-dependencies", hidden=True)
+def plugins_sync_dependencies():
+    """启动前同步已启用插件声明的依赖；失败由加载器隔离。"""
+    from src.plugins.dependencies import sync_plugin_dependencies
+
+    manager = PluginManager()
+    failures = sync_plugin_dependencies(
+        settings.plugins,
+        root_dir=manager.root_dir,
+    )
+    for plugin_id, message in failures.items():
+        click.echo(f"插件 {plugin_id} {message}")
+
+
+@plugins_group.command("validate-installation", hidden=True)
+def plugins_validate_installation():
+    """启动前校验插件目录身份。"""
+    _plugin_operation(lambda: PluginManager().validate_installation())
+
+
 @plugins_group.command("clear-field-owners")
+@click.option("--entity", type=click.Choice(["movie", "actor"]), default="movie", show_default=True)
 @click.option("--plugin-id", required=True, type=str, help="解除接管的目标插件 id。")
 @click.option(
     "--field",
@@ -478,13 +503,15 @@ def plugins_check(plugin_dir: Path):
     type=str,
     help="只清除指定字段的 owner（可重复）；不传则清除该插件全部字段 owner。",
 )
-def plugins_clear_field_owners(plugin_id: str, fields: tuple[str, ...]):
-    """解除插件对 Movie 受保护字段的接管（插件被删除后其字段会冻结，用本命令释放回宿主）。"""
+def plugins_clear_field_owners(plugin_id: str, fields: tuple[str, ...], entity: str):
+    """解除插件对影片或演员字段的接管，保留字段值。"""
+    from src.service.catalog.actor_ownership_gateway import ActorOwnershipGateway
     from src.service.catalog.movie_ownership_gateway import MovieOwnershipGateway
 
     _ensure_database_ready()
     try:
-        affected = MovieOwnershipGateway.release_plugin_owners(
+        gateway = ActorOwnershipGateway if entity == "actor" else MovieOwnershipGateway
+        affected = gateway.release_plugin_owners(
             plugin_id,
             fields=fields if fields else None,
         )
@@ -502,51 +529,6 @@ def plugins_clear_field_owners(plugin_id: str, fields: tuple[str, ...]):
 # ---------------------------------------------------------------------------
 # 非 APS 命令（保持不变）
 # ---------------------------------------------------------------------------
-
-
-@main.command(name="add-media-library")
-@click.option("--name", required=True, type=str, help="Media library name.")
-@click.option(
-    "--root-path",
-    required=True,
-    type=str,
-    help="Absolute root path for media library.",
-)
-def add_media_library(name: str, root_path: str):
-    logger.info("CLI add-media-library start name={} root_path={}", name, root_path)
-    _ensure_database_ready()
-    try:
-        library = MediaLibraryService.create_library(
-            MediaLibraryCreateRequest(
-                name=name,
-                backend=MediaLibraryBackend.LOCAL,
-                backend_config={"root_path": root_path},
-            )
-        )
-    except ApiError as exc:
-        logger.warning(
-            "CLI add-media-library validation failed code={} detail={}",
-            exc.code,
-            exc.details,
-        )
-        raise click.ClickException(exc.code)
-    except Exception:
-        logger.exception("CLI add-media-library crashed name={} root_path={}", name, root_path)
-        raise
-
-    library_root_path = library.backend_config.get("root_path", "")
-    logger.info(
-        "CLI add-media-library finished library_id={} name={} root_path={}",
-        library.id,
-        library.name,
-        library_root_path,
-    )
-    click.echo(
-        "media library created: "
-        f"library_id={library.id} "
-        f"name={library.name} "
-        f"root_path={library_root_path}"
-    )
 
 
 @main.command(name="reset-account")
@@ -636,129 +618,6 @@ def backfill_movie_thin_cover_images():
         f"updated_movies={stats['updated_movies']} "
         f"skipped_movies={stats['skipped_movies']} "
         f"failed_movies={stats['failed_movies']}"
-    )
-
-
-@main.command(name="migrate-jav-layout")
-@click.option("--library-id", type=int, default=None,
-              help="只迁移指定本地 library；缺省时处理全部本地媒体库。")
-@click.option("--dry-run", is_flag=True, default=False,
-              help="只统计不改任何东西，用于升级前预览规模。")
-def migrate_jav_layout(library_id: int | None, dry_run: bool):
-    """把本地媒体库的 JAV 从 <root>/番号/ 迁到 <root>/jav/番号/。
-
-    单文件 4 步流程 + DB update 原子提交点，Ctrl+C / crash 后重跑可自动收敛：
-    已达 F 的走 fast-path skip，中间态的会被恢复。
-    """
-    logger.info("CLI migrate-jav-layout start library_id={} dry_run={}", library_id, dry_run)
-    _ensure_database_ready()
-
-    def _progress(current: int, total: int, current_library_id: int) -> None:
-        # 每 50 条打一次点，加上末尾一次；避免大库时 stderr 静默
-        if current % 50 == 0 or current == total:
-            click.echo(
-                f"  library_id={current_library_id}  {current}/{total}",
-                err=True,
-            )
-
-    stats = JavLayoutMigrationService.run(
-        library_id=library_id,
-        dry_run=dry_run,
-        progress_callback=_progress,
-    )
-    payload = stats.to_dict()
-    logger.info("CLI migrate-jav-layout finished dry_run={} stats={}", dry_run, payload)
-    click.echo(
-        "jav layout migrate finished "
-        f"(dry_run={str(dry_run).lower()}): {payload}"
-    )
-
-
-@main.command(name="migrate-plot-layout")
-@click.option("--dry-run", is_flag=True, default=False,
-              help="只统计不改任何东西，用于升级前预览规模。")
-def migrate_plot_layout(dry_run: bool):
-    """把影片剧照从 movies/<num>/plots/N.ext 平铺成 movies/<num>/plot-N.ext。
-
-    3 步流程 + image.origin 单条 UPDATE 原子提交点，Ctrl+C / crash 后重跑可自动收敛：
-    已达 F 的走 fast-path（LIKE 查询天然不命中新格式），中间态的会被恢复。
-    """
-    logger.info("CLI migrate-plot-layout start dry_run={}", dry_run)
-    _ensure_database_ready()
-
-    def _progress(current: int, total: int) -> None:
-        # 每 200 条打一次点，加上末尾一次；image 表规模比 media 大，节流粒度更粗。
-        if current % 200 == 0 or current == total:
-            click.echo(f"  {current}/{total}", err=True)
-
-    stats = PlotLayoutMigrationService.run(
-        dry_run=dry_run,
-        progress_callback=_progress,
-    )
-    payload = stats.to_dict()
-    logger.info("CLI migrate-plot-layout finished dry_run={} stats={}", dry_run, payload)
-    click.echo(
-        "plot layout migrate finished "
-        f"(dry_run={str(dry_run).lower()}): {payload}"
-    )
-
-
-@main.command(name="migrate-movie-asset-shard")
-@click.option("--dry-run", is_flag=True, default=False,
-              help="只统计不改任何东西，用于升级前预览规模。")
-def migrate_movie_asset_shard(dry_run: bool):
-    """把影片资产从 movies/<番号>/ 分片成 movies/<sha1(番号)[:2]>/<番号>/。
-
-    两阶段（整目录 rename 归片 + image.origin 前缀批量重写），Ctrl+C / crash 后重跑可自动收敛：
-    已归片的目录不再出现在 movies/ 顶层天然跳过，DB 侧只重写老布局行。
-    """
-    logger.info("CLI migrate-movie-asset-shard start dry_run={}", dry_run)
-    _ensure_database_ready()
-
-    def _progress(phase: str, current: int, total: int) -> None:
-        # 目录阶段 total 未知（-1，边扫边搬），image 阶段有确切总量；两阶段都节流打点。
-        step = 50
-        if current % step == 0:
-            click.echo(f"  {phase} {current}/{total}", err=True)
-
-    stats = MovieAssetShardMigrationService.run(
-        dry_run=dry_run,
-        progress_callback=_progress,
-    )
-    payload = stats.to_dict()
-    logger.info("CLI migrate-movie-asset-shard finished dry_run={} stats={}", dry_run, payload)
-    click.echo(
-        "movie asset shard migrate finished "
-        f"(dry_run={str(dry_run).lower()}): {payload}"
-    )
-
-
-@main.command(name="migrate-movie-subtitles")
-@click.option("--dry-run", is_flag=True, default=False,
-              help="只统计不改任何东西，用于升级前预览规模。")
-def migrate_movie_subtitles(dry_run: bool):
-    """把字幕从媒体库 sidecar 与旧字幕根统一收敛到 movies/<shard>/<番号>/subtitles/。
-
-    单文件 3 步（link/copy -> UPDATE file_path -> unlink old），subtitle.file_path 单条 UPDATE
-    是原子提交点，Ctrl+C / crash 后重跑可自动收敛。建议在 migrate-movie-asset-shard 之后运行。
-    """
-    logger.info("CLI migrate-movie-subtitles start dry_run={}", dry_run)
-    _ensure_database_ready()
-
-    def _progress(current: int, total: int) -> None:
-        # 字幕表规模远小于 image，节流粒度更细。
-        if current % 50 == 0 or current == total:
-            click.echo(f"  {current}/{total}", err=True)
-
-    stats = MovieSubtitleUnifyMigrationService.run(
-        dry_run=dry_run,
-        progress_callback=_progress,
-    )
-    payload = stats.to_dict()
-    logger.info("CLI migrate-movie-subtitles finished dry_run={} stats={}", dry_run, payload)
-    click.echo(
-        "movie subtitle unify migrate finished "
-        f"(dry_run={str(dry_run).lower()}): {payload}"
     )
 
 

@@ -2,9 +2,9 @@ from typing import Any
 
 from loguru import logger
 
-from src.metadata.factory import build_javdb_provider
-from src.common.service_helpers import emit_progress
 from src.common.runtime_time import utc_now_for_db
+from src.common.service_helpers import emit_progress
+from src.metadata.factory import build_javdb_provider
 from src.model import Actor, Movie, MovieActor
 from src.service.catalog.catalog_import_service import CatalogImportService
 
@@ -128,7 +128,7 @@ class SubscribedActorMovieSyncService:
         actor.subscribed_movies_synced_at = synced_at
         if mode == "full" and actor.subscribed_movies_full_synced_at is None:
             actor.subscribed_movies_full_synced_at = synced_at
-        actor.save()
+        actor.save(only=[Actor.subscribed_movies_synced_at, Actor.subscribed_movies_full_synced_at])
         logger.info(
             "Subscribed actor sync actor finished actor_id={} actor_javdb_id={} mode={} imported_movies={} stop_reason={} synced_at={}",
             actor.id,
