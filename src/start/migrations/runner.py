@@ -115,7 +115,7 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
 
         for module in _list_migration_modules(applied_names):
             migration_name = str(getattr(module, "name", "")).strip()
-            if migration_name.startswith(("202604", "202605", "202606", "202607", "202608")):
+            if migration_name.startswith(("202604", "202605", "202606", "202607", "202608", "202609")):
                 # The production schema already contains the v0.5/v0.6 model
                 # changes, but its audit table predates the consolidated migration
                 # records. Replaying those historical migrations can drop/alter
