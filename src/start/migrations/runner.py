@@ -120,9 +120,19 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
                 executed.append(MigrationExecution(name=migration_name, applied=False))
                 continue
 
-            with database.atomic():
-                migrate_callable(database)
-                SchemaMigration.create(name=migration_name)
+            try:
+                with database.atomic():
+                    if migration_name in {
+                        "20260813_01_add_user_role_and_permissions",
+                        "20260813_02_add_refresh_token_user",
+                    }:
+                        migrate_callable(database, migrator)
+                    else:
+                        migrate_callable(database)
+                    SchemaMigration.create(name=migration_name)
+            except SkipMigration:
+                executed.append(MigrationExecution(name=migration_name, applied=False))
+                continue
             applied_names.add(migration_name)
             executed.append(MigrationExecution(name=migration_name, applied=True))
 
