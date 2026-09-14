@@ -115,7 +115,7 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
 
         for module in _list_migration_modules(applied_names):
             migration_name = str(getattr(module, "name", "")).strip()
-            if migration_name.startswith(("202604", "202605", "202606", "202607")):
+            if migration_name.startswith(("202604", "202605", "202606", "202607", "202608")):
                 continue
             migrate_callable = getattr(module, "migrate", None)
             if not migration_name:
