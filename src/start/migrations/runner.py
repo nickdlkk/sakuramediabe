@@ -120,6 +120,24 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
             # Only migrations after the last known audit entry are candidates.
             if migration_name <= "20260816_01_add_movie_field_owners":
                 continue
+            if migration_name in {
+                "20260821_01_consolidate_task_runtime",
+                "20260823_01_unify_movie_collection_owner",
+                "20260823_02_backfill_actor_gender_from_movie_extra",
+                "20260823_03_add_movie_blacklist",
+                "20260826_01_remove_media_special_tags",
+                "20260830_01_add_image_search_queue_indexes",
+                "20260831_01_add_image_search_index_space_state",
+                "20260831_02_remove_hot_review_item",
+                "20260903_01_add_media_import_source_identity",
+                "20260905_01_add_actor_metadata",
+                "20260905_02_add_plugin_movie_metadata",
+                "20260908_01_add_download_resource_history",
+                "20260910_01_add_moment_collections",
+                "20260910_02_add_actor_local_profile",
+                "20260912_01_add_plugin_collection_ownership",
+            }:
+                continue
             migrate_callable = getattr(module, "migrate", None)
             if not migration_name:
                 raise ValueError(f"migration_name_missing: {module.__name__}")
