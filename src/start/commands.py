@@ -181,10 +181,10 @@ def migrate():
     logger.info("CLI migrate start")
     from src.start.migrations import run_pending_migrations
 
-    # 旧库必须先执行字段迁移，再按当前模型补齐新增表和索引。
-    database = _connect_database_for_migration()
-    before_create_summary = run_pending_migrations(database)
+    # 生产库已完成手动结构迁移；先按当前模型补表/索引，再执行审计迁移。
     database = _ensure_database_ready()
+    before_create_summary = run_pending_migrations(database)
+    database = _connect_database_for_migration()
     after_create_summary = run_pending_migrations(database)
     summary = _merge_migration_summaries(before_create_summary, after_create_summary)
     for execution in summary.executed:
