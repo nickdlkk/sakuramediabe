@@ -5,11 +5,16 @@ from importlib import import_module
 from pathlib import Path
 from types import ModuleType
 
-from peewee import Database
+from peewee import Database, PostgresqlDatabase
+from playhouse.migrate import PostgresqlMigrator
 
 from src.model import SchemaMigration
 
 VERSIONS_DIR = Path(__file__).resolve().parent / "versions"
+
+
+class SkipMigration(RuntimeError):
+    """迁移前置条件尚未满足时显式跳过。"""
 
 CONSOLIDATED_MIGRATION_NAME = "20260821_01_consolidate_task_runtime"
 MOVIE_COLLECTION_OWNER_MIGRATION_NAME = "20260823_01_unify_movie_collection_owner"
@@ -47,6 +52,12 @@ class MigrationRunSummary:
         return sum(1 for item in self.executed if not item.applied)
 
 
+def _build_migrator(database: Database):
+    if isinstance(database, PostgresqlDatabase):
+        return PostgresqlMigrator(database)
+    raise ValueError(f"unsupported_migration_database: {type(database).__name__}")
+
+
 def _load_migration_module(path: Path) -> ModuleType:
     return import_module(f"src.start.migrations.versions.{path.stem}")
 
@@ -82,6 +93,7 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
     with database.bind_ctx([SchemaMigration], bind_refs=False, bind_backrefs=False):
         # 迁移记录表由迁移命令显式托管，不依赖 initdb/aps 启动期补库。
         database.create_tables([SchemaMigration], safe=True)
+        migrator = _build_migrator(database)
         applied_names = {item.name for item in SchemaMigration.select(SchemaMigration.name)}
         _validate_migration_source(database, applied_names)
         executed: list[MigrationExecution] = []
