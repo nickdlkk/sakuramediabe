@@ -62,10 +62,14 @@ def _load_migration_module(path: Path) -> ModuleType:
     return import_module(f"src.start.migrations.versions.{path.stem}")
 
 
-def _list_migration_modules() -> list[ModuleType]:
+def _list_migration_modules(applied_names: set[str] | None = None) -> list[ModuleType]:
     modules: list[ModuleType] = []
     for path in sorted(VERSIONS_DIR.glob("*.py")):
         if path.name == "__init__.py":
+            continue
+        # Do not import already-applied historical modules: old migration files
+        # may reference model symbols removed by later releases.
+        if applied_names is not None and path.stem in applied_names:
             continue
         modules.append(_load_migration_module(path))
     return modules
@@ -109,7 +113,7 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
             # 新库只记录 consolidated marker，业务迁移由当前模型建表，不应尝试执行。
             return MigrationRunSummary(executed=[])
 
-        for module in _list_migration_modules():
+        for module in _list_migration_modules(applied_names):
             migration_name = str(getattr(module, "name", "")).strip()
             migrate_callable = getattr(module, "migrate", None)
             if not migration_name:
