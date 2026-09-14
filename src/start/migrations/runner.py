@@ -115,11 +115,10 @@ def run_pending_migrations(database: Database) -> MigrationRunSummary:
 
         for module in _list_migration_modules(applied_names):
             migration_name = str(getattr(module, "name", "")).strip()
-            if migration_name.startswith(("202604", "202605", "202606", "202607", "202608", "202609")):
-                # The production schema already contains the v0.5/v0.6 model
-                # changes, but its audit table predates the consolidated migration
-                # records. Replaying those historical migrations can drop/alter
-                # columns that the current schema intentionally removed.
+            # The production schema already reflects the legacy release line.
+            # Historical rows missing from the audit table must not be replayed.
+            # Only migrations after the last known audit entry are candidates.
+            if migration_name <= "20260816_01_add_movie_field_owners":
                 continue
             migrate_callable = getattr(module, "migrate", None)
             if not migration_name:
